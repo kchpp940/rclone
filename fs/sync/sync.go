@@ -51,6 +51,9 @@ type syncCopyMove struct {
 	noTraverse             bool                   // if set don't traverse the dst
 	noCheckDest            bool                   // if set transfer all objects regardless without checking dst
 	noUnicodeNormalization bool                   // don't normalize unicode characters in filenames
+	deletersWg             sync.WaitGroup         // for delete before go routine
+	deleteFilesCh          chan fs.Object         // channel to receive deletes if delete before
+	deletePlan             *operations.DeletePlan // unified deletion plan shared across all delete modes
 	trackRenames           bool                   // set if we should do server-side renames
 	trackRenamesStrategy   trackRenamesStrategy   // strategies used for tracking renames
 	dstFilesMu             sync.Mutex             // protect dstFiles
@@ -151,6 +154,8 @@ func newSyncCopyMove(ctx context.Context, fdst, fsrc fs.Fs, deleteMode fs.Delete
 		noTraverse:             ci.NoTraverse,
 		noCheckDest:            ci.NoCheckDest,
 		noUnicodeNormalization: ci.NoUnicodeNormalization,
+		deleteFilesCh:          make(chan fs.Object, ci.Checkers),
+		deletePlan:             operations.NewDeletePlan(backupDir),
 		trackRenames:           ci.TrackRenames,
 		commonHash:             fsrc.Hashes().Overlap(fdst.Hashes()).GetOne(),
 		modifyWindow:           fs.GetModifyWindow(ctx, fsrc, fdst),
@@ -598,10 +603,24 @@ func (s *syncCopyMove) stopTrackRenames() {
 
 // This starts the background deletion of files for --delete-during
 func (s *syncCopyMove) startDeleters() {
+	if s.deleteMode != fs.DeleteModeDuring && s.deleteMode != fs.DeleteModeOnly {
+		return
+	}
+	s.deletersWg.Add(1)
+	go func() {
+		defer s.deletersWg.Done()
+		err := operations.DeleteFilesWithBackupDir(s.ctx, s.deleteFilesCh, s.backupDir)
+		s.processError(err)
+	}()
 }
 
 // This stops the background deleters
 func (s *syncCopyMove) stopDeleters() {
+	if s.deleteMode != fs.DeleteModeDuring && s.deleteMode != fs.DeleteModeOnly {
+		return
+	}
+	close(s.deleteFilesCh)
+	s.deletersWg.Wait()
 }
 
 // This deletes the files in the dstFiles map.  If checkSrcMap is set

@@ -631,22 +631,37 @@ func DeleteFiles(ctx context.Context, toBeDeleted fs.ObjectsChan) error {
 	return DeleteFilesWithBackupDir(ctx, toBeDeleted, nil)
 }
 
-// DeletePlan holds a unified, pre-computed deletion plan shared by
-// candidate enumeration, --max-delete enforcement, --dry-run preview
-// and actual execution. All three delete modes (During, After, Only)
-// consume the same plan so dry-run output matches real deletion
-// behaviour exactly.
+// DeletePlan holds a unified deletion plan shared by candidate
+// enumeration, --max-delete enforcement, --dry-run preview and
+// actual execution. All three delete modes (During, After, Only)
+// consume the same classification logic so dry-run output matches real
+// deletion behaviour exactly.
+//
+// DeletePlan can be used in two ways:
+//   - Incremental: call AddCandidate for each object as it is
+//     discovered (used by DeleteModeDuring / DeleteModeOnly).
+//     Classification happens immediately in arrival order.
+//   - Batch: call BuildDeletePlan with all candidates at once
+//     (used by DeleteModeAfter).
+//
+// In both modes the classification logic is identical: --max-delete
+// and --max-delete-size are applied in the same order with the
+// same result.
 type DeletePlan struct {
-	// Candidates is every deletion candidate in deterministic
-	// (lexicographic by Remote()) order. It is the authoritative
-	// list produced by the enumeration phase and is never mutated
-	// after BuildDeletePlan returns.
+	mu sync.Mutex
+
+	// BackupDir is the backup directory to use instead of
+	// deleting, or nil if --backup-dir is not in effect.
+	BackupDir fs.Fs
+
+	// Candidates is every deletion candidate in arrival order.
+	// It is the authoritative list and is never mutated after the
+	// enumeration phase ends.
 	Candidates fs.Objects
 
 	// ToDelete contains the candidates that fall within
 	// --max-delete / --max-delete-size and will actually be
-	// deleted (or moved to backup-dir). Same objects as the
-	// prefix of Candidates.
+	// deleted (or moved to backup-dir).
 	ToDelete fs.Objects
 
 	// Skipped contains the candidates that exceed
@@ -656,56 +671,76 @@ type DeletePlan struct {
 	// semantics.
 	Skipped fs.Objects
 
-	// BackupDir is the backup directory to use instead of
-	// deleting, or nil if --backup-dir is not in effect.
-	BackupDir fs.Fs
-
 	// ExceedsLimit is true when the number or total size of the
 	// candidates exceeds --max-delete / --max-delete-size.
 	ExceedsLimit bool
+
+	count int64
+	size  int64
+}
+
+// NewDeletePlan creates an empty DeletePlan ready for incremental
+// use with AddCandidate.
+//
+// backupDir may be nil.
+func NewDeletePlan(backupDir fs.Fs) *DeletePlan {
+	return &DeletePlan{BackupDir: backupDir}
+}
+
+// AddCandidate adds a single deletion candidate and classifies it as
+// ToDelete or Skipped based on --max-delete / --max-delete-size.
+//
+// Returns true if the candidate was classified as ToDelete (within the
+// limit), false if it was classified as Skipped.
+//
+// The classification is done in arrival order and is safe for
+// concurrent use.
+func (p *DeletePlan) AddCandidate(ctx context.Context, o fs.Object) bool {
+	ci := fs.GetConfig(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.Candidates = append(p.Candidates, o)
+
+	oSize := o.Size()
+	if oSize < 0 {
+		oSize = 0
+	}
+
+	withinCount := ci.MaxDelete < 0 || p.count+1 <= ci.MaxDelete
+	withinSize := ci.MaxDeleteSize < 0 || p.size+oSize <= int64(ci.MaxDeleteSize)
+
+	if withinCount && withinSize {
+		p.ToDelete = append(p.ToDelete, o)
+		p.count++
+		p.size += oSize
+		return true
+	}
+
+	p.Skipped = append(p.Skipped, o)
+	p.ExceedsLimit = true
+	return false
 }
 
 // BuildDeletePlan turns an unordered collection of deletion
-// candidates into a deterministic DeletePlan.
+// candidates into a fully classified DeletePlan.
 //
 // The candidates are sorted lexicographically by Remote() so that
-// --max-delete applies to the same files regardless of map iteration
-// order, goroutine scheduling or delete mode.
+// --max-delete applies to the same files regardless of map
+// iteration order.
 //
 // backupDir may be nil.
 func BuildDeletePlan(ctx context.Context, candidates fs.Objects, backupDir fs.Fs) *DeletePlan {
-	ci := fs.GetConfig(ctx)
-
 	sorted := make(fs.Objects, 0, len(candidates))
 	sorted = append(sorted, candidates...)
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].Remote() < sorted[j].Remote()
 	})
 
-	plan := &DeletePlan{
-		Candidates: sorted,
-		BackupDir:  backupDir,
-	}
-
-	var count int64
-	var size int64
+	plan := NewDeletePlan(backupDir)
 	for _, o := range sorted {
-		oSize := o.Size()
-		if oSize < 0 {
-			oSize = 0
-		}
-		withinCount := ci.MaxDelete < 0 || count+1 <= ci.MaxDelete
-		withinSize := ci.MaxDeleteSize < 0 || size+oSize <= int64(ci.MaxDeleteSize)
-		if withinCount && withinSize {
-			plan.ToDelete = append(plan.ToDelete, o)
-			count++
-			size += oSize
-		} else {
-			plan.Skipped = append(plan.Skipped, o)
-		}
+		plan.AddCandidate(ctx, o)
 	}
-
-	plan.ExceedsLimit = len(plan.Skipped) > 0
 	return plan
 }
 
@@ -717,10 +752,10 @@ func BuildDeletePlan(ctx context.Context, candidates fs.Objects, backupDir fs.Fs
 // objects are actually modified.
 //
 // In a real run the ToDelete objects are deleted (or moved to
-// backup-dir) concurrently. If plan.ExceedsLimit is true the Skipped
-// objects are logged and the original --max-delete fatal-error
-// semantics are preserved: the function returns a FatalError so the
-// caller knows the safety threshold was reached.
+// backup-dir) concurrently. If plan.ExceedsLimit is true the
+// Skipped objects are logged and the original --max-delete
+// fatal-error semantics are preserved: the function returns a
+// FatalError so the caller knows the safety threshold was reached.
 func ExecuteDeletePlan(ctx context.Context, plan *DeletePlan) error {
 	ci := fs.GetConfig(ctx)
 	if ci.DryRun {
