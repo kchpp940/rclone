@@ -397,9 +397,6 @@ func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
 			sum.renameQueueSize += stats.renameQueueSize
 			sum.deletes += stats.deletes
 			sum.deletesSize += stats.deletesSize
-			if stats.deleteLimitExceeded {
-				sum.deleteLimitExceeded = true
-			}
 			sum.deletedDirs += stats.deletedDirs
 			sum.inProgress.merge(stats.inProgress)
 			sum.startedTransfers = append(sum.startedTransfers, stats.startedTransfers...)

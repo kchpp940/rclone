@@ -552,31 +552,13 @@ func DeleteFileWithBackupDir(ctx context.Context, dst fs.Object, backupDir fs.Fs
 	defer func() {
 		tr.Done(ctx, err)
 	}()
-	ci := fs.GetConfig(ctx)
-	action := "delete"
-	if backupDir != nil {
-		action = "move into backup dir"
-	}
-	if ci.DryRun {
-		stats := accounting.Stats(ctx)
-		err = stats.DeleteFile(ctx, dst.Size())
-		if err != nil {
-			return err
-		}
-		if stats.DeleteLimitExceeded() {
-			fs.Logf(dst, "Skipped %s as --max-delete threshold would be reached (dry-run preview)", fs.LogValue("skipped", action))
-		} else {
-			_ = SkipDestructive(ctx, dst, action)
-		}
-		return nil
-	}
-	actioned := "Deleted"
-	if backupDir != nil {
-		actioned = "Moved into backup dir"
-	}
 	err = accounting.Stats(ctx).DeleteFile(ctx, dst.Size())
 	if err != nil {
 		return err
+	}
+	action, actioned := "delete", "Deleted"
+	if backupDir != nil {
+		action, actioned = "move into backup dir", "Moved into backup dir"
 	}
 	skip := SkipDestructive(ctx, dst, action)
 	if skip {
@@ -613,23 +595,13 @@ func DeleteFilesWithBackupDir(ctx context.Context, toBeDeleted fs.ObjectsChan, b
 	wg.Add(ci.Checkers)
 	var errorCount atomic.Int32
 	var fatalErrorCount atomic.Int32
-	var maxDeleteReached atomic.Bool
 
 	for range ci.Checkers {
 		go func() {
 			defer wg.Done()
 			for dst := range toBeDeleted {
-				if maxDeleteReached.Load() && !ci.DryRun {
-					fs.Debugf(dst, "Not deleting as --max-delete threshold reached")
-					continue
-				}
 				err := DeleteFileWithBackupDir(ctx, dst, backupDir)
 				if err != nil {
-					if errors.Is(err, accounting.ErrMaxDelete) || errors.Is(err, accounting.ErrMaxDeleteSize) {
-						maxDeleteReached.Store(true)
-						fs.Debugf(dst, "Not deleting as --max-delete threshold reached")
-						continue
-					}
 					errorCount.Add(1)
 					logger, _ := GetLogger(ctx)
 					logger(ctx, TransferError, nil, dst, err)
@@ -644,18 +616,12 @@ func DeleteFilesWithBackupDir(ctx context.Context, toBeDeleted fs.ObjectsChan, b
 	}
 	fs.Debugf(nil, "Waiting for deletions to finish")
 	wg.Wait()
-	if maxDeleteReached.Load() {
-		fs.Logf(nil, "--max-delete threshold reached - some files not deleted")
-	}
-	if fatalErrorCount.Load() > 0 {
-		err := fmt.Errorf("failed to delete %d files", errorCount.Load())
-		return fserrors.FatalError(err)
-	}
 	if errorCount.Load() > 0 {
-		return fmt.Errorf("failed to delete %d files", errorCount.Load())
-	}
-	if maxDeleteReached.Load() {
-		return fmt.Errorf("--max-delete threshold reached")
+		err := fmt.Errorf("failed to delete %d files", errorCount.Load())
+		if fatalErrorCount.Load() > 0 {
+			return fserrors.FatalError(err)
+		}
+		return err
 	}
 	return nil
 }
@@ -663,6 +629,162 @@ func DeleteFilesWithBackupDir(ctx context.Context, toBeDeleted fs.ObjectsChan, b
 // DeleteFiles removes all the files passed in the channel
 func DeleteFiles(ctx context.Context, toBeDeleted fs.ObjectsChan) error {
 	return DeleteFilesWithBackupDir(ctx, toBeDeleted, nil)
+}
+
+// DeletePlan holds a unified, pre-computed deletion plan shared by
+// candidate enumeration, --max-delete enforcement, --dry-run preview
+// and actual execution. All three delete modes (During, After, Only)
+// consume the same plan so dry-run output matches real deletion
+// behaviour exactly.
+type DeletePlan struct {
+	// Candidates is every deletion candidate in deterministic
+	// (lexicographic by Remote()) order. It is the authoritative
+	// list produced by the enumeration phase and is never mutated
+	// after BuildDeletePlan returns.
+	Candidates fs.Objects
+
+	// ToDelete contains the candidates that fall within
+	// --max-delete / --max-delete-size and will actually be
+	// deleted (or moved to backup-dir). Same objects as the
+	// prefix of Candidates.
+	ToDelete fs.Objects
+
+	// Skipped contains the candidates that exceed
+	// --max-delete / --max-delete-size and will not be deleted.
+	// In --dry-run these are still previewed; in a real run they
+	// are logged as skipped and trigger the original fatal-error
+	// semantics.
+	Skipped fs.Objects
+
+	// BackupDir is the backup directory to use instead of
+	// deleting, or nil if --backup-dir is not in effect.
+	BackupDir fs.Fs
+
+	// ExceedsLimit is true when the number or total size of the
+	// candidates exceeds --max-delete / --max-delete-size.
+	ExceedsLimit bool
+}
+
+// BuildDeletePlan turns an unordered collection of deletion
+// candidates into a deterministic DeletePlan.
+//
+// The candidates are sorted lexicographically by Remote() so that
+// --max-delete applies to the same files regardless of map iteration
+// order, goroutine scheduling or delete mode.
+//
+// backupDir may be nil.
+func BuildDeletePlan(ctx context.Context, candidates fs.Objects, backupDir fs.Fs) *DeletePlan {
+	ci := fs.GetConfig(ctx)
+
+	sorted := make(fs.Objects, 0, len(candidates))
+	sorted = append(sorted, candidates...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Remote() < sorted[j].Remote()
+	})
+
+	plan := &DeletePlan{
+		Candidates: sorted,
+		BackupDir:  backupDir,
+	}
+
+	var count int64
+	var size int64
+	for _, o := range sorted {
+		oSize := o.Size()
+		if oSize < 0 {
+			oSize = 0
+		}
+		withinCount := ci.MaxDelete < 0 || count+1 <= ci.MaxDelete
+		withinSize := ci.MaxDeleteSize < 0 || size+oSize <= int64(ci.MaxDeleteSize)
+		if withinCount && withinSize {
+			plan.ToDelete = append(plan.ToDelete, o)
+			count++
+			size += oSize
+		} else {
+			plan.Skipped = append(plan.Skipped, o)
+		}
+	}
+
+	plan.ExceedsLimit = len(plan.Skipped) > 0
+	return plan
+}
+
+// ExecuteDeletePlan runs the deletion plan.
+//
+// In --dry-run mode every candidate is previewed: ToDelete objects
+// are shown as "would delete / would move to backup-dir" and Skipped
+// objects are shown as "would exceed --max-delete threshold". No
+// objects are actually modified.
+//
+// In a real run the ToDelete objects are deleted (or moved to
+// backup-dir) concurrently. If plan.ExceedsLimit is true the Skipped
+// objects are logged and the original --max-delete fatal-error
+// semantics are preserved: the function returns a FatalError so the
+// caller knows the safety threshold was reached.
+func ExecuteDeletePlan(ctx context.Context, plan *DeletePlan) error {
+	ci := fs.GetConfig(ctx)
+	if ci.DryRun {
+		return executeDeletePlanDryRun(ctx, plan)
+	}
+	return executeDeletePlanReal(ctx, plan)
+}
+
+func executeDeletePlanDryRun(ctx context.Context, plan *DeletePlan) error {
+	action := "delete"
+	if plan.BackupDir != nil {
+		action = "move into backup dir"
+	}
+	stats := accounting.Stats(ctx)
+	for _, o := range plan.ToDelete {
+		tr := stats.NewCheckingTransfer(o, "deleting")
+		err := stats.DeleteFile(ctx, o.Size())
+		if err != nil {
+			tr.Done(ctx, err)
+			return err
+		}
+		_ = SkipDestructive(ctx, o, action)
+		tr.Done(ctx, nil)
+	}
+	for _, o := range plan.Skipped {
+		tr := stats.NewCheckingTransfer(o, "deleting")
+		fs.Logf(o, "Skipped %s as --max-delete threshold would be reached (dry-run preview)", fs.LogValue("skipped", action))
+		tr.Done(ctx, nil)
+	}
+	return nil
+}
+
+func executeDeletePlanReal(ctx context.Context, plan *DeletePlan) error {
+	if len(plan.ToDelete) == 0 && len(plan.Skipped) == 0 {
+		return nil
+	}
+
+	toDelete := make(fs.ObjectsChan, fs.GetConfig(ctx).Checkers)
+	go func() {
+		for _, o := range plan.ToDelete {
+			toDelete <- o
+		}
+		close(toDelete)
+	}()
+	err := DeleteFilesWithBackupDir(ctx, toDelete, plan.BackupDir)
+
+	if plan.ExceedsLimit {
+		action := "delete"
+		if plan.BackupDir != nil {
+			action = "move into backup dir"
+		}
+		for _, o := range plan.Skipped {
+			fs.Logf(o, "Not %s as --max-delete threshold reached", action)
+		}
+		fs.Logf(nil, "--max-delete threshold reached - some files not deleted")
+		if errors.Is(err, accounting.ErrMaxDelete) || errors.Is(err, accounting.ErrMaxDeleteSize) {
+			return err
+		}
+		if err != nil {
+			return fserrors.FatalError(fmt.Errorf("%v: --max-delete threshold reached", err))
+		}
+		return accounting.ErrMaxDelete
+	}
+	return err
 }
 
 // ReadFile reads the object into memory and accounts it

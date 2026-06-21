@@ -55,7 +55,6 @@ type StatsInfo struct {
 	renameQueueSize       int64
 	deletes               int64
 	deletesSize           int64
-	deleteLimitExceeded   bool
 	deletedDirs           int64
 	inProgress            *inProgress
 	startedTransfers      []*Transfer   // currently active transfers
@@ -130,7 +129,6 @@ func (s *StatsInfo) RemoteStats(short bool) (out rc.Params, err error) {
 	out["checks"] = s.checks
 	out["transfers"] = s.transfers
 	out["deletes"] = s.deletes
-	out["deleteLimitExceeded"] = s.deleteLimitExceeded
 	out["deletedDirs"] = s.deletedDirs
 	out["renames"] = s.renames
 	out["listed"] = s.listed
@@ -663,12 +661,6 @@ var (
 //
 // It may return fatal errors if the threshold for --max-delete or
 // --max-delete-size have been reached.
-//
-// In --dry-run mode, it counts all delete candidates but does not
-// return a fatal error when the threshold is exceeded. Instead it
-// logs a warning and sets a flag so the caller can distinguish
-// between files that would actually be deleted vs files that are
-// merely being previewed beyond the limit.
 func (s *StatsInfo) DeleteFile(ctx context.Context, size int64) error {
 	ci := fs.GetConfig(ctx)
 	s.mu.Lock()
@@ -676,33 +668,15 @@ func (s *StatsInfo) DeleteFile(ctx context.Context, size int64) error {
 	if size < 0 {
 		size = 0
 	}
-	maxDeleteExceeded := ci.MaxDelete >= 0 && s.deletes+1 > ci.MaxDelete
-	maxDeleteSizeExceeded := ci.MaxDeleteSize >= 0 && s.deletesSize+size > int64(ci.MaxDeleteSize)
-	if maxDeleteExceeded || maxDeleteSizeExceeded {
-		if ci.DryRun {
-			s.deletes++
-			s.deletesSize += size
-			s.deleteLimitExceeded = true
-			return nil
-		}
-		if maxDeleteExceeded {
-			return ErrMaxDelete
-		}
+	if ci.MaxDelete >= 0 && s.deletes+1 > ci.MaxDelete {
+		return ErrMaxDelete
+	}
+	if ci.MaxDeleteSize >= 0 && s.deletesSize+size > int64(ci.MaxDeleteSize) {
 		return ErrMaxDeleteSize
 	}
 	s.deletes++
 	s.deletesSize += size
 	return nil
-}
-
-// DeleteLimitExceeded returns true if --max-delete or --max-delete-size
-// was exceeded during a --dry-run. This allows callers to know that
-// the delete count includes files that would not actually be deleted
-// because they exceed the limit.
-func (s *StatsInfo) DeleteLimitExceeded() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.deleteLimitExceeded
 }
 
 // GetDeletes returns the number of deletes
@@ -750,7 +724,6 @@ func (s *StatsInfo) ResetCounters() {
 	s.transfers = 0
 	s.deletes = 0
 	s.deletesSize = 0
-	s.deleteLimitExceeded = false
 	s.deletedDirs = 0
 	s.renames = 0
 	s.listed = 0

@@ -51,8 +51,6 @@ type syncCopyMove struct {
 	noTraverse             bool                   // if set don't traverse the dst
 	noCheckDest            bool                   // if set transfer all objects regardless without checking dst
 	noUnicodeNormalization bool                   // don't normalize unicode characters in filenames
-	deletersWg             sync.WaitGroup         // for delete before go routine
-	deleteFilesCh          chan fs.Object         // channel to receive deletes if delete before
 	trackRenames           bool                   // set if we should do server-side renames
 	trackRenamesStrategy   trackRenamesStrategy   // strategies used for tracking renames
 	dstFilesMu             sync.Mutex             // protect dstFiles
@@ -153,7 +151,6 @@ func newSyncCopyMove(ctx context.Context, fdst, fsrc fs.Fs, deleteMode fs.Delete
 		noTraverse:             ci.NoTraverse,
 		noCheckDest:            ci.NoCheckDest,
 		noUnicodeNormalization: ci.NoUnicodeNormalization,
-		deleteFilesCh:          make(chan fs.Object, ci.Checkers),
 		trackRenames:           ci.TrackRenames,
 		commonHash:             fsrc.Hashes().Overlap(fdst.Hashes()).GetOne(),
 		modifyWindow:           fs.GetModifyWindow(ctx, fsrc, fdst),
@@ -601,22 +598,10 @@ func (s *syncCopyMove) stopTrackRenames() {
 
 // This starts the background deletion of files for --delete-during
 func (s *syncCopyMove) startDeleters() {
-	if s.deleteMode != fs.DeleteModeDuring && s.deleteMode != fs.DeleteModeOnly {
-		return
-	}
-	s.deletersWg.Go(func() {
-		err := operations.DeleteFilesWithBackupDir(s.ctx, s.deleteFilesCh, s.backupDir)
-		s.processError(err)
-	})
 }
 
 // This stops the background deleters
 func (s *syncCopyMove) stopDeleters() {
-	if s.deleteMode != fs.DeleteModeDuring && s.deleteMode != fs.DeleteModeOnly {
-		return
-	}
-	close(s.deleteFilesCh)
-	s.deletersWg.Wait()
 }
 
 // This deletes the files in the dstFiles map.  If checkSrcMap is set
@@ -624,43 +609,33 @@ func (s *syncCopyMove) stopDeleters() {
 // file map, otherwise it unconditionally deletes them.  If
 // checkSrcMap is clear then it assumes that the any source files that
 // have been found have been removed from dstFiles already.
+//
+// The deletion is driven by a single unified DeletePlan which is
+// shared between candidate enumeration, --max-delete enforcement,
+// --dry-run preview and actual execution so that all three delete
+// modes produce identical results.
 func (s *syncCopyMove) deleteFiles(checkSrcMap bool) error {
+	var candidates fs.Objects
+	for remote, o := range s.dstFiles {
+		if checkSrcMap {
+			_, exists := s.srcFiles[remote]
+			if exists {
+				continue
+			}
+		}
+		candidates = append(candidates, o)
+	}
+
 	if accounting.Stats(s.ctx).Errored() && !s.ci.IgnoreErrors {
 		fs.Errorf(s.fdst, "%v", fs.ErrorNotDeleting)
-		for remote, o := range s.dstFiles {
-			if checkSrcMap {
-				_, exists := s.srcFiles[remote]
-				if exists {
-					continue
-				}
-			}
+		for _, o := range candidates {
 			s.logger(s.ctx, operations.TransferError, nil, o, fs.ErrorNotDeleting)
 		}
 		return fs.ErrorNotDeleting
 	}
 
-	toDelete := make(fs.ObjectsChan, s.ci.Checkers)
-	go func() {
-	outer:
-		for remote, o := range s.dstFiles {
-			if checkSrcMap {
-				_, exists := s.srcFiles[remote]
-				if exists {
-					continue
-				}
-			}
-			if s.aborting() {
-				break
-			}
-			select {
-			case <-s.ctx.Done():
-				break outer
-			case toDelete <- o:
-			}
-		}
-		close(toDelete)
-	}()
-	return operations.DeleteFilesWithBackupDir(s.ctx, toDelete, s.backupDir)
+	plan := operations.BuildDeletePlan(s.ctx, candidates, s.backupDir)
+	return operations.ExecuteDeletePlan(s.ctx, plan)
 }
 
 // This deletes the empty directories in the slice passed in.  It
@@ -985,16 +960,12 @@ func (s *syncCopyMove) run() error {
 	s.stopTransfers()
 	s.stopDeleters()
 
-	if s.deleteMode == fs.DeleteModeAfter {
+	if s.deleteMode != fs.DeleteModeOff {
 		if s.currentError() != nil && !s.ci.IgnoreErrors {
 			fs.Errorf(s.fdst, "%v", fs.ErrorNotDeleting)
 		} else {
 			s.processError(s.deleteFiles(false))
 		}
-	}
-
-	if s.deleteMode != fs.DeleteModeOff && accounting.Stats(s.ctx).DeleteLimitExceeded() {
-		fs.Logf(s.fdst, "--max-delete threshold reached - some files not deleted")
 	}
 
 	// Update modtimes for directories if necessary
@@ -1059,21 +1030,9 @@ func (s *syncCopyMove) DstOnly(dst fs.DirEntry) (recurse bool) {
 	switch x := dst.(type) {
 	case fs.Object:
 		s.logger(s.ctx, operations.MissingOnSrc, nil, x, nil)
-		switch s.deleteMode {
-		case fs.DeleteModeAfter:
-			// record object as needs deleting
-			s.dstFilesMu.Lock()
-			s.dstFiles[x.Remote()] = x
-			s.dstFilesMu.Unlock()
-		case fs.DeleteModeDuring, fs.DeleteModeOnly:
-			select {
-			case <-s.ctx.Done():
-				return
-			case s.deleteFilesCh <- x:
-			}
-		default:
-			panic(fmt.Sprintf("unexpected delete mode %d", s.deleteMode))
-		}
+		s.dstFilesMu.Lock()
+		s.dstFiles[x.Remote()] = x
+		s.dstFilesMu.Unlock()
 	case fs.Directory:
 		// Do the same thing to the entire contents of the directory
 		// Record directory as it is potentially empty and needs deleting
