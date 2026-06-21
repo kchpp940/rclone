@@ -627,7 +627,6 @@ func (s *syncCopyMove) stopDeleters() {
 func (s *syncCopyMove) deleteFiles(checkSrcMap bool) error {
 	if accounting.Stats(s.ctx).Errored() && !s.ci.IgnoreErrors {
 		fs.Errorf(s.fdst, "%v", fs.ErrorNotDeleting)
-		// log all deletes as errors
 		for remote, o := range s.dstFiles {
 			if checkSrcMap {
 				_, exists := s.srcFiles[remote]
@@ -640,7 +639,6 @@ func (s *syncCopyMove) deleteFiles(checkSrcMap bool) error {
 		return fs.ErrorNotDeleting
 	}
 
-	// Delete the spare files
 	toDelete := make(fs.ObjectsChan, s.ci.Checkers)
 	go func() {
 	outer:
@@ -987,13 +985,16 @@ func (s *syncCopyMove) run() error {
 	s.stopTransfers()
 	s.stopDeleters()
 
-	// Delete files after
 	if s.deleteMode == fs.DeleteModeAfter {
 		if s.currentError() != nil && !s.ci.IgnoreErrors {
 			fs.Errorf(s.fdst, "%v", fs.ErrorNotDeleting)
 		} else {
 			s.processError(s.deleteFiles(false))
 		}
+	}
+
+	if s.deleteMode != fs.DeleteModeOff && accounting.Stats(s.ctx).DeleteLimitExceeded() {
+		fs.Logf(s.fdst, "--max-delete threshold reached - some files not deleted")
 	}
 
 	// Update modtimes for directories if necessary

@@ -552,17 +552,34 @@ func DeleteFileWithBackupDir(ctx context.Context, dst fs.Object, backupDir fs.Fs
 	defer func() {
 		tr.Done(ctx, err)
 	}()
+	ci := fs.GetConfig(ctx)
+	action := "delete"
+	if backupDir != nil {
+		action = "move into backup dir"
+	}
+	if ci.DryRun {
+		stats := accounting.Stats(ctx)
+		err = stats.DeleteFile(ctx, dst.Size())
+		if err != nil {
+			return err
+		}
+		if stats.DeleteLimitExceeded() {
+			fs.Logf(dst, "Skipped %s as --max-delete threshold would be reached (dry-run preview)", fs.LogValue("skipped", action))
+		} else {
+			_ = SkipDestructive(ctx, dst, action)
+		}
+		return nil
+	}
+	actioned := "Deleted"
+	if backupDir != nil {
+		actioned = "Moved into backup dir"
+	}
 	err = accounting.Stats(ctx).DeleteFile(ctx, dst.Size())
 	if err != nil {
 		return err
 	}
-	action, actioned := "delete", "Deleted"
-	if backupDir != nil {
-		action, actioned = "move into backup dir", "Moved into backup dir"
-	}
 	skip := SkipDestructive(ctx, dst, action)
 	if skip {
-		// do nothing
 	} else if backupDir != nil {
 		err = MoveBackupDir(ctx, backupDir, dst)
 	} else {
@@ -596,13 +613,23 @@ func DeleteFilesWithBackupDir(ctx context.Context, toBeDeleted fs.ObjectsChan, b
 	wg.Add(ci.Checkers)
 	var errorCount atomic.Int32
 	var fatalErrorCount atomic.Int32
+	var maxDeleteReached atomic.Bool
 
 	for range ci.Checkers {
 		go func() {
 			defer wg.Done()
 			for dst := range toBeDeleted {
+				if maxDeleteReached.Load() && !ci.DryRun {
+					fs.Debugf(dst, "Not deleting as --max-delete threshold reached")
+					continue
+				}
 				err := DeleteFileWithBackupDir(ctx, dst, backupDir)
 				if err != nil {
+					if errors.Is(err, accounting.ErrMaxDelete) || errors.Is(err, accounting.ErrMaxDeleteSize) {
+						maxDeleteReached.Store(true)
+						fs.Debugf(dst, "Not deleting as --max-delete threshold reached")
+						continue
+					}
 					errorCount.Add(1)
 					logger, _ := GetLogger(ctx)
 					logger(ctx, TransferError, nil, dst, err)
@@ -617,12 +644,18 @@ func DeleteFilesWithBackupDir(ctx context.Context, toBeDeleted fs.ObjectsChan, b
 	}
 	fs.Debugf(nil, "Waiting for deletions to finish")
 	wg.Wait()
-	if errorCount.Load() > 0 {
+	if maxDeleteReached.Load() {
+		fs.Logf(nil, "--max-delete threshold reached - some files not deleted")
+	}
+	if fatalErrorCount.Load() > 0 {
 		err := fmt.Errorf("failed to delete %d files", errorCount.Load())
-		if fatalErrorCount.Load() > 0 {
-			return fserrors.FatalError(err)
-		}
-		return err
+		return fserrors.FatalError(err)
+	}
+	if errorCount.Load() > 0 {
+		return fmt.Errorf("failed to delete %d files", errorCount.Load())
+	}
+	if maxDeleteReached.Load() {
+		return fmt.Errorf("--max-delete threshold reached")
 	}
 	return nil
 }
