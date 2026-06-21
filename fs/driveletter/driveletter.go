@@ -13,25 +13,12 @@ func IsDriveLetter(name string) bool {
 }
 
 // IsWindowsDrivePath returns true if the path looks like a Windows drive
-// path such as C:\, C:/, C:path, \\server\share, etc.
+// path such as C:\, C:/, C:path.
 //
-// This function works on all platforms to allow consistent path parsing.
+// On non-Windows platforms this always returns false since there is no
+// concept of drive letters, allowing single-letter remote names like "C:".
 func IsWindowsDrivePath(path string) bool {
-	if len(path) < 2 {
-		return false
-	}
-	c := path[0]
-	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-		return false
-	}
-	if path[1] != ':' {
-		return false
-	}
-	if len(path) == 2 {
-		return true
-	}
-	next := path[2]
-	return next == '/' || next == '\\' || next != 0
+	return false
 }
 
 // IsUNCPath returns true if the path looks like a Windows UNC path

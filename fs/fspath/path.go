@@ -117,20 +117,22 @@ func Parse(path string) (parsed Parsed, err error) {
 		return parsed, nil
 	}
 	// Check for UNC paths first - these always start with // or \\
+	// This applies to all platforms
 	if driveletter.IsUNCPath(path) {
 		return parsed, nil
 	}
-	// Check for Windows drive paths on all platforms for consistent parsing
-	// e.g. C:\, C:/, C:path, D:
-	if driveletter.IsWindowsDrivePath(path) {
-		return parsed, nil
-	}
-	// If path starts with / or . followed by / or \ then it's a local path
+	// If path starts with / or . followed by / or \ then it's an explicit local path
 	// even if it contains a : later, e.g. "/path:/to/file" or "./:colon.txt"
+	// This applies to all platforms
 	if len(path) >= 1 && (path[0] == '/' || path[0] == '\\') {
 		return parsed, nil
 	}
 	if len(path) >= 2 && path[0] == '.' && (path[1] == '/' || path[1] == '\\') {
+		return parsed, nil
+	}
+	// Check for Windows drive paths - but only on Windows platforms
+	// On non-Windows, a single letter followed by : is a valid remote name
+	if driveletter.IsWindowsDrivePath(path) {
 		return parsed, nil
 	}
 	// States for parser
@@ -170,10 +172,10 @@ loop:
 				return parsed, nil
 			} else if c == ':' || c == ',' {
 				parsed.Name = path[:i]
-				// Check if this looks like a Windows drive path on all platforms
-				// for consistent parsing. This handles cases like C: or D:path
-				// that should not be treated as remote names.
-				if c == ':' && len(parsed.Name) == 1 && driveletter.IsWindowsDrivePath(path[:i+1]) {
+				// Check if this looks like a Windows drive letter.
+				// IsDriveLetter returns true only on Windows for single letters A-Z,
+				// so on non-Windows platforms single-letter remote names like "C:" work.
+				if c == ':' && len(parsed.Name) == 1 && driveletter.IsDriveLetter(parsed.Name) {
 					parsed.Name = ""
 					return parsed, nil
 				}

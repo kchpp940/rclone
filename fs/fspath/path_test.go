@@ -343,6 +343,96 @@ func TestParse(t *testing.T) {
 			},
 			noWin: true,
 		}, {
+			in: `C:`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `C:`,
+			},
+			win: true,
+		}, {
+			in: `C:`,
+			wantParsed: Parsed{
+				Name:         "C",
+				ConfigString: "C",
+				Path:         ``,
+			},
+			noWin: true,
+		}, {
+			in: `C:file.txt`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `C:file.txt`,
+			},
+			win: true,
+		}, {
+			in: `C:file.txt`,
+			wantParsed: Parsed{
+				Name:         "C",
+				ConfigString: "C",
+				Path:         `file.txt`,
+			},
+			noWin: true,
+		}, {
+			in: `//server/share/path`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `//server/share/path`,
+			},
+		}, {
+			in: `\\\\server\\share\\path`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `//server/share/path`,
+			},
+			win: true,
+		}, {
+			in: `\\\\server\\share\\path`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `\\\\server\\share\\path`,
+			},
+			noWin: true,
+		}, {
+			in: `/C:/path`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `/C:/path`,
+			},
+		}, {
+			in: `./C:file`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `./C:file`,
+			},
+		}, {
+			in: `foo:bar`,
+			wantParsed: Parsed{
+				Name:         "foo",
+				ConfigString: "foo",
+				Path:         `bar`,
+			},
+		}, {
+			in: `alias:crypt:path`,
+			wantParsed: Parsed{
+				Name:         "alias",
+				ConfigString: "alias",
+				Path:         `crypt:path`,
+			},
+		}, {
+			in: `crypt:chunker:data`,
+			wantParsed: Parsed{
+				Name:         "crypt",
+				ConfigString: "crypt",
+				Path:         `chunker:data`,
+			},
+		}, {
+			in: `chunker:alias:crypt:path`,
+			wantParsed: Parsed{
+				Name:         "chunker",
+				ConfigString: "chunker",
+				Path:         `alias:crypt:path`,
+			},
+		}, {
 			in: `:backend,param1:/path/to/file`,
 			wantParsed: Parsed{
 				ConfigString: `:backend,param1`,
@@ -639,6 +729,17 @@ func TestJoinRootPath(t *testing.T) {
 		{"s3:dir", "..", "s3:dir"},
 		{"s3:dir", "/..", "s3:dir"},
 		{"s3:dir", "/../", "s3:dir"},
+		{"C:", "path", "C:path"},
+		{"C:base", "sub", "C:base/sub"},
+		{"C:base/", "sub", "C:base/sub"},
+		{"alias:", "crypt:path", "alias:crypt:path"},
+		{"alias:crypt:base", "sub", "alias:crypt:base/sub"},
+		{"crypt:", "chunker:data", "crypt:chunker:data"},
+		{"crypt:chunker:base", "sub", "crypt:chunker:base/sub"},
+		{"chunker:alias:crypt:base", "sub", "chunker:alias:crypt:base/sub"},
+		{"remote:path", "to/file", "remote:path/to/file"},
+		{":s3,key=xxx:", "path", ":s3,key=xxx:path"},
+		{":s3,key=xxx:base", "sub", ":s3,key=xxx:base/sub"},
 	} {
 		got := JoinRootPath(test.remote, test.filePath)
 		assert.Equal(t, test.want, got, test)
