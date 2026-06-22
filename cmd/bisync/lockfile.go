@@ -33,20 +33,20 @@ func (b *bisyncRun) setLockFile() (err error) {
 		b.lockFile = b.basePath + ".lck"
 		if bilib.FileExists(b.lockFile) {
 			if !b.lockFileIsExpired() {
-			errTip := Color(terminal.MagentaFg, "Tip: this indicates that another bisync run (of these same paths) either is still running or was interrupted before completion. \n")
-			errTip += Color(terminal.MagentaFg, "If you're SURE you want to override this safety feature, you can delete the lock file with the following command, then run bisync again: \n")
-			errTip += fmt.Sprintf(Color(terminal.HiRedFg, "rclone deletefile \"%s\""), b.lockFile)
-			return fmt.Errorf(Color(terminal.RedFg, "prior lock file found: %s \n")+errTip, Color(terminal.HiYellowFg, b.lockFile))
+				errTip := Color(terminal.MagentaFg, "Tip: this indicates that another bisync run (of these same paths) either is still running or was interrupted before completion. \n")
+				errTip += Color(terminal.MagentaFg, "If you're SURE you want to override this safety feature, you can delete the lock file with the following command, then run bisync again: \n")
+				errTip += fmt.Sprintf(Color(terminal.HiRedFg, "rclone deletefile \"%s\""), b.lockFile)
+				return fmt.Errorf(Color(terminal.RedFg, "prior lock file found: %s \n")+errTip, Color(terminal.HiYellowFg, b.lockFile))
+			}
+			// Lock file was expired - archive its stale temp files into a
+			// timestamped recovery archive directory with a manifest. This is
+			// an atomic batch operation: if interrupted mid-archive, the
+			// next run will resume and finalize it.
+			fs.Infof(nil, Color(terminal.GreenFg, "Archiving stale files from expired/interrupted prior run"))
+			b.ensureNoStaleBasePathFiles("lock-expired")
+			// Also remove the expired lock file itself so we can recreate it cleanly
+			_ = os.Remove(b.lockFile)
 		}
-		// Lock file was expired - archive its stale temp files into a
-		// timestamped recovery archive directory with a manifest. This is
-		// an atomic batch operation: if interrupted mid-archive, the
-		// next run will resume and finalize it.
-		fs.Infof(nil, Color(terminal.GreenFg, "Archiving stale files from expired/interrupted prior run"))
-		b.ensureNoStaleBasePathFiles("lock-expired")
-		// Also remove the expired lock file itself so we can recreate it cleanly
-		_ = os.Remove(b.lockFile)
-	}
 
 		pidStr := []byte(strconv.Itoa(os.Getpid()))
 		if err = os.WriteFile(b.lockFile, pidStr, bilib.PermSecure); err != nil {
@@ -56,17 +56,43 @@ func (b *bisyncRun) setLockFile() (err error) {
 		b.renewLockFile()
 		b.lockFileOpt.stopRenewal = b.startLockRenewal()
 	}
-	// After lock acquired, if a failed-run marker (.lst-err) exists from a
-	// previous run, archive all stale prior-run files (listings, queues,
-	// etc.) into a recovery archive directory with a manifest. This
-	// ensures old queued deltas, old filter hashes, and old error markers
-	// never interfere with the new run while still preserving them for
-	// diagnosis. The archive operation is atomic: if interrupted, the
-	// next run will resume it.
-	if bilib.FileExists(b.listing1+"-err") || bilib.FileExists(b.listing2+"-err") {
+
+	// ---- UNCONDITIONAL RECOVERY CHECK ----
+	// Before proceeding with any listing/delta computation, we must ensure
+	// no half-finished recovery archives are left dangling, and that no
+	// stale prior-run files remain in the basePath. The ensureNoStaleBasePathFiles
+	// call:
+	//   1. Scans for any recovery directories with in_progress manifests
+	//   2. Resumes moving any remaining stale files into those directories
+	//   3. Marks the manifests complete
+	//   4. If new stale files are found (e.g. .lst-err from a failed run),
+	//      creates a fresh recovery archive for them
+	//
+	// This is the critical barrier that guarantees old queued deltas,
+	// old filter hashes, or old .lst-err markers never leak into the
+	// current run's delta/listing computations.
+	hasFailedMarker := bilib.FileExists(b.listing1+"-err") || bilib.FileExists(b.listing2+"-err")
+	if hasFailedMarker {
 		fs.Infof(nil, Color(terminal.GreenFg, "Detected failed-run marker; archiving stale listing/queue artifacts from prior run"))
 		b.ensureNoStaleBasePathFiles("failed-run-detected")
+	} else {
+		// Even without a failed-run marker, there may be in-progress
+		// recovery archives from a mid-archive interruption. Finalize
+		// those first.
+		for _, dir := range b.findRecoveryDirs() {
+			b.finalizeRecoveryArchive(dir)
+		}
 	}
+
+	// Double-check after recovery: no stale files should be left in basePath.
+	// If any are still present (shouldn't happen, but defensive), do a
+	// final sweep.
+	remaining := b.listStaleFiles()
+	if len(remaining) > 0 {
+		fs.Infof(nil, Color(terminal.YellowFg, "%d stale files still present after recovery pass; final archive sweep"), len(remaining))
+		b.ensureNoStaleBasePathFiles("final-sweep")
+	}
+
 	return nil
 }
 

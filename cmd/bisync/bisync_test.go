@@ -1233,36 +1233,77 @@ func (b *bisyncTest) runBisync(ctx context.Context, args []string) (err error) {
 	return nil
 }
 
-// saveTestListings creates a copy of test artifacts with given prefix
-// including listings (.lst*), queues (.que) and filters (.flt, .flt.md5)
-// It also picks up any recovery-archived stale files (.recovery_* suffix)
-// and copies them under their original name so that scenario snapshots
-// reflect the complete state including failed-run diagnostics.
-func (b *bisyncTest) saveTestListings(prefix string, keepSource bool) (err error) {
-	count := 0
-	// Collect candidate files including recovery archives, preferring a
-	// non-archived file over any archived variant of the same base name.
-	seen := map[string]string{} // baseName -> actual file on disk
+// scanWorkDirFiles scans the work directory and returns a map of
+// baseName -> actualDiskPath for all files, including those inside
+// recovery archive directories. For files that exist both in the
+// root and in a recovery dir, the root copy takes precedence.
+//
+// Recovery directories have the pattern "{prefix}.recovery_{runId}/"
+// and contain the original filenames.
+func (b *bisyncTest) scanWorkDirFiles() map[string]string {
+	seen := map[string]string{} // baseName -> actual disk path (relative to workDir)
+
+	// First pass: root-level files (highest priority)
 	files, err := os.ReadDir(b.workDir)
 	if err != nil {
-		return err
+		return seen
 	}
 	for _, f := range files {
 		name := f.Name()
 		if strings.Contains(name, ".DS_Store") {
 			continue
 		}
-		base := name
-		if idx := strings.Index(name, ".recovery_"); idx != -1 {
-			base = name[:idx]
+		if f.IsDir() {
+			continue // recovery dirs handled in second pass
 		}
-		// Prefer non-archived over archived. Replace only if:
-		// - first time seeing this base, OR
-		// - previously stored was recovery-archived, and current one is not
-		if prev, ok := seen[base]; !ok || (strings.Contains(prev, ".recovery_") && !strings.Contains(name, ".recovery_")) {
-			seen[base] = name
+		if _, exists := seen[name]; !exists {
+			seen[name] = name
 		}
 	}
+
+	// Second pass: recovery directories (lower priority)
+	for _, f := range files {
+		name := f.Name()
+		if !f.IsDir() {
+			continue
+		}
+		if !strings.Contains(name, ".recovery_") {
+			continue
+		}
+		// Scan files inside this recovery directory
+		recoveryPath := filepath.Join(b.workDir, name)
+		recoveryFiles, err := os.ReadDir(recoveryPath)
+		if err != nil {
+			continue
+		}
+		for _, rf := range recoveryFiles {
+			rName := rf.Name()
+			if rName == "manifest.json" {
+				continue
+			}
+			if rf.IsDir() {
+				continue
+			}
+			if _, exists := seen[rName]; !exists {
+				// Store relative path from workDir
+				seen[rName] = filepath.Join(name, rName)
+			}
+		}
+	}
+
+	return seen
+}
+
+// saveTestListings creates a copy of test artifacts with given prefix
+// including listings (.lst*), queues (.que) and filters (.flt, .flt.md5)
+// It also picks up any recovery-archived stale files (in .recovery_*
+// directories) and copies them under their original name so that scenario
+// snapshots reflect the complete state including failed-run diagnostics.
+func (b *bisyncTest) saveTestListings(prefix string, keepSource bool) (err error) {
+	count := 0
+	// Collect candidate files including those inside recovery directories.
+	// Root-level files take precedence over recovery-archived copies.
+	seen := b.scanWorkDirFiles()
 
 	for baseName, srcFile := range seen {
 		switch fileType(baseName) {
@@ -1468,28 +1509,23 @@ func (b *bisyncTest) compareResults() int {
 	goldenFiles := b.listDir(b.goldenDir)
 	resultFiles := b.listDir(b.workDir)
 
-	// Independently scan workDir BEFORE the rename step so we can capture
-	// recovery-archived files under their actual on-disk names.
-	// Recovery files are "diagnostic residuals" – they should only be used
-	// to passively match a file that the Golden set explicitly expects.
-	allWorkFiles, err := os.ReadDir(b.workDir)
-	require.NoError(b.t, err, "failed to read workDir")
-	recoveryMap := map[string]string{} // goldenBaseName -> actual disk file name
-	for _, f := range allWorkFiles {
-		name := f.Name()
-		if strings.Contains(name, ".DS_Store") {
-			continue
-		}
-		// Compute what this file's golden base name would be:
-		// first apply toGolden, then strip the recovery suffix.
-		goldName := b.toGolden(name)
-		if idx := strings.Index(goldName, ".recovery_"); idx != -1 {
-			base := goldName[:idx]
-			if _, exists := recoveryMap[base]; !exists {
-				// Store the original (un-goldened) disk file name so we
-				// can actually open it later when resolving.
-				recoveryMap[base] = name
-			}
+	// Independently scan workDir to capture all files including those
+	// inside recovery archive directories. Recovery files are "diagnostic
+	// residuals" – they should only be used to passively match a file
+	// that the Golden set explicitly expects.
+	//
+	// Recovery directories have the pattern "{prefix}.recovery_{runId}/"
+	// and contain the original filenames (e.g. foo.lst-err, not
+	// foo.lst-err.recovery_xxx).
+	allFiles := b.scanWorkDirFiles() // baseName -> relative path from workDir
+
+	// Build recoveryMap: baseName -> actual relative disk path
+	// (only for files that are inside recovery directories, not at root)
+	recoveryMap := map[string]string{}
+	for baseName, relPath := range allFiles {
+		// If the path contains a directory separator, it's inside a recovery dir
+		if strings.Contains(relPath, string(os.PathSeparator)) {
+			recoveryMap[baseName] = relPath
 		}
 	}
 
@@ -1502,10 +1538,28 @@ func (b *bisyncTest) compareResults() int {
 			goldPath := filepath.Join(b.workDir, goldName)
 			require.NoError(b.t, os.Rename(filePath, goldPath))
 			renamed = true
+			// Update allFiles map for the renamed file
+			if _, ok := allFiles[fileName]; ok {
+				delete(allFiles, fileName)
+				allFiles[goldName] = goldName
+			}
+			if _, ok := recoveryMap[fileName]; ok {
+				// This shouldn't happen since recovery files are in subdirs
+				delete(recoveryMap, fileName)
+				recoveryMap[goldName] = recoveryMap[fileName]
+			}
 		}
 	}
 	if renamed {
 		resultFiles = b.listDir(b.workDir)
+		// Re-scan to pick up renamed files
+		allFiles = b.scanWorkDirFiles()
+		recoveryMap = map[string]string{}
+		for baseName, relPath := range allFiles {
+			if strings.Contains(relPath, string(os.PathSeparator)) {
+				recoveryMap[baseName] = relPath
+			}
+		}
 	}
 
 	// resolve returns the result file that represents the given golden file.
@@ -1774,7 +1828,17 @@ func (b *bisyncTest) mangleResult(dir, file string, golden bool) string {
 		if strings.Contains(s, ".recovery_") ||
 			strings.Contains(s, "archiving stale") ||
 			strings.Contains(s, "Archiving stale") ||
-			strings.Contains(s, "Archived stale") {
+			strings.Contains(s, "Archived stale") ||
+			strings.Contains(s, "recovery archive") ||
+			strings.Contains(s, "Recovery archive") ||
+			strings.Contains(s, "Resuming incomplete") ||
+			strings.Contains(s, "resuming incomplete") ||
+			strings.Contains(s, "recovery dir") ||
+			strings.Contains(s, "Recovery dir") ||
+			strings.Contains(s, "stale files still present") ||
+			strings.Contains(s, "final archive sweep") ||
+			strings.Contains(s, "in_progress") ||
+			strings.Contains(s, "manifest") {
 			continue
 		}
 
@@ -2046,13 +2110,9 @@ func (b *bisyncTest) listDir(dir string) (names []string) {
 // Notes:
 // - "filtersfile.txt" will NOT be recognized as a filters file
 // - only "test.log" will be recognized as a test log file
+// - files inside recovery archive directories have their original names
+//   so no special handling is needed for them
 func fileType(fileName string) string {
-	// Strip any recovery-archive suffix first so that archived stale
-	// files (e.g. foo.lst-err.recovery_20260101_000000) are still
-	// classified by their underlying type.
-	if idx := strings.Index(fileName, ".recovery_"); idx != -1 {
-		fileName = fileName[:idx]
-	}
 	if fileName == logFileName {
 		return "log"
 	}

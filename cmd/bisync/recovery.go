@@ -95,20 +95,23 @@ func readRecoveryManifest(dir string) (*recoveryManifest, error) {
 // listStaleFiles returns the full paths of all stale prior-run files that
 // should be archived. These are listings, queues, and error markers
 // associated with the current basePath.
+// listStaleFiles returns a list of stale prior-run files that should be
+// archived to a recovery directory before starting a new bisync run.
+//
+// Stale files are those left behind by a FAILED prior run. Files from a
+// SUCCESSFUL prior run (.lst, .lst-old, .lst-dry, .lst-dry-old) are NOT
+// considered stale – they are needed for delta computation in the next run.
 func (b *bisyncRun) listStaleFiles() []string {
+	// Only check for files that indicate a FAILED prior run.
+	// Successful prior-run files (.lst, .lst-old, .lst-dry, .lst-dry-old)
+	// must remain in place for delta comparison.
 	candidates := []string{
-		b.listing1 + "-new",
-		b.listing1 + "-old",
-		b.listing1 + "-dry",
-		b.listing1 + "-dry-new",
-		b.listing1 + "-dry-old",
 		b.listing1 + "-err",
-		b.listing2 + "-new",
-		b.listing2 + "-old",
-		b.listing2 + "-dry",
-		b.listing2 + "-dry-new",
-		b.listing2 + "-dry-old",
+		b.listing1 + "-new",
+		b.listing1 + "-dry-new",
 		b.listing2 + "-err",
+		b.listing2 + "-new",
+		b.listing2 + "-dry-new",
 		b.basePath + ".copy1to2.que",
 		b.basePath + ".copy2to1.que",
 		b.basePath + ".delete1.que",
@@ -121,14 +124,17 @@ func (b *bisyncRun) listStaleFiles() []string {
 			seen[p] = true
 		}
 	}
-	// Also glob for any variant we might have missed
+	// Also glob for any variant we might have missed.
+	// Note: we use b.basePath + "." as prefix to avoid matching
+	// files from other test runs that happen to have b.basePath
+	// as an infix (e.g. "missing-listings.{basePath}.path1.lst-new").
+	//
+	// Only glob for failure-indicating files, not for successful-run files.
 	globPatterns := []string{
-		b.basePath + "*.lst-dry*",
-		b.basePath + "*.lst-new",
-		b.basePath + "*.lst-old",
-		b.basePath + "*.lst-err",
-		b.basePath + "*.lst-control",
-		b.basePath + "*.que",
+		b.basePath + ".*.lst-err",
+		b.basePath + ".*.lst-new",
+		b.basePath + ".*.lst-dry-new",
+		b.basePath + ".*.que",
 	}
 	for _, pat := range globPatterns {
 		if ls, err := filepath.Glob(pat); err == nil {
