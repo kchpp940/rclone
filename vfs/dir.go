@@ -1188,8 +1188,6 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 		return err
 	}
-
-	isPendingRename := false
 	switch x := oldNode.DirEntry().(type) {
 	case nil:
 		if oldFile, ok := oldNode.(*File); ok {
@@ -1197,7 +1195,6 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 				return err
 			}
-			isPendingRename = oldFile.HasPendingRename()
 		} else {
 			fs.Errorf(oldPath, "Dir.Rename can't rename open file that is not a vfs.File")
 			return EPERM
@@ -1208,7 +1205,6 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 				return err
 			}
-			isPendingRename = oldFile.HasPendingRename()
 		} else {
 			err := fmt.Errorf("Fs %q can't rename file that is not a vfs.File", d.f)
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
@@ -1240,14 +1236,6 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		err = fmt.Errorf("unknown type %T", oldNode)
 		fs.Errorf(d.path, "Dir.Rename error: %v", err)
 		return err
-	}
-
-	// If the rename was deferred (pending), don't move the directory
-	// entry yet. It will be moved atomically along with the cache item
-	// and writeback state when the pending rename commits (after all
-	// writers close).
-	if isPendingRename {
-		return nil
 	}
 
 	// Show moved - delete from old dir and add to new

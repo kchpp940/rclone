@@ -378,17 +378,28 @@ func testFileRename(t *testing.T, mode vfscommon.CacheMode, inCache bool, forceC
 	require.NoError(t, err)
 	newItem := fstest.NewItem("newLeaf", string(newContents), item.ModTime)
 
-	// check file has been renamed immediately in the cache
+	// check file has been renamed at VFS layer immediately (POSIX semantics)
+	// but cache item remains at old path until pending rename commits
 	if inCache {
-		assert.True(t, vfs.cache.Exists("newLeaf"))
+		// During pending rename, cache item is still at the old path
+		assert.True(t, vfs.cache.Exists(item.Path))
+		assert.False(t, vfs.cache.Exists("newLeaf"))
 	}
 
 	// check file exists in the vfs layer at its new name
 	_, err = vfs.Stat("newLeaf")
 	require.NoError(t, err)
 
-	// Close the file
+	// Close the file - this triggers applyPendingRename which commits
+	// the backend rename (cache item, writeback queue, virtual dir entries)
 	require.NoError(t, fd.Close())
+
+	// After close, cache item should have moved to the new path
+	if inCache {
+		vfs.WaitForWriters(waitForWritersDelay)
+		assert.True(t, vfs.cache.Exists("newLeaf"))
+		assert.False(t, vfs.cache.Exists(item.Path))
+	}
 
 	// Check file has now been renamed on the remote
 	item.Path = "newLeaf"
@@ -417,4 +428,106 @@ func TestFileRename(t *testing.T) {
 
 func TestFileStructSize(t *testing.T) {
 	t.Logf("File struct has size %d bytes", unsafe.Sizeof(File{}))
+}
+
+// TestFileRenamePendingRollback tests that when a pending rename fails,
+// the VFS node state and directory entries are rolled back to the old path.
+func TestFileRenamePendingRollback(t *testing.T) {
+	for _, mode := range []vfscommon.CacheMode{
+		vfscommon.CacheModeWrites,
+		vfscommon.CacheModeFull,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			r, vfs, file, _ := fileCreate(t, mode)
+
+			if !operations.CanServerSideMove(r.Fremote) {
+				t.Skip("skip as can't rename files")
+			}
+
+			rootDir, err := vfs.Root()
+			require.NoError(t, err)
+			dir := file.Dir()
+
+			// Write some data to make the file dirty
+			fd, err := file.Open(os.O_RDWR | os.O_CREATE | os.O_TRUNC)
+			require.NoError(t, err)
+			_, err = fd.Write([]byte("file contents"))
+			require.NoError(t, err)
+
+			// Rename while file is open - this creates a pending rename
+			err = dir.Rename("file1", "newLeaf", rootDir)
+			require.NoError(t, err)
+
+			// Verify VFS layer shows the new name immediately
+			_, err = vfs.Stat("newLeaf")
+			require.NoError(t, err)
+			_, err = vfs.Stat("dir/file1")
+			require.Error(t, err) // old path should not exist
+
+			// Verify cache is still at old path (pending rename not committed)
+			require.True(t, vfs.cache.Exists("dir/file1"))
+			require.False(t, vfs.cache.Exists("newLeaf"))
+
+			// Verify pending rename state exists
+			require.True(t, file.HasPendingRename())
+
+			// Now inject a failing pendingRenameFun to simulate backend rename failure
+			renameErr := fmt.Errorf("simulated backend rename failure")
+			file.mu.Lock()
+			origPendingRenameFun := file.pendingRenameFun
+			origPendingRename := file.pendingRename
+			file.pendingRenameFun = func(ctx context.Context) (fs.Object, error) {
+				return nil, renameErr
+			}
+			file.mu.Unlock()
+
+			// Close the file - this triggers applyPendingRename which should fail and rollback
+			require.NoError(t, fd.Close())
+			vfs.WaitForWriters(waitForWritersDelay)
+
+			// After rollback, VFS layer should show the old name again
+			_, err = vfs.Stat("dir/file1")
+			require.NoError(t, err)
+			_, err = vfs.Stat("newLeaf")
+			require.Error(t, err) // new path should not exist after rollback
+
+			// Cache should still be at old path
+			require.True(t, vfs.cache.Exists("dir/file1"))
+			require.False(t, vfs.cache.Exists("newLeaf"))
+
+			// File node should be back at old path
+			require.Equal(t, "dir/file1", file.Path())
+			require.Equal(t, "file1", file.Name())
+
+			// Pending rename state should still exist for retry
+			require.True(t, file.HasPendingRename())
+
+			// Restore original pending rename function and let it succeed
+			file.mu.Lock()
+			file.pendingRenameFun = origPendingRenameFun
+			file.pendingRename = origPendingRename
+			file.mu.Unlock()
+
+			// Trigger applyPendingRename again - should succeed now
+			file.applyPendingRename()
+			vfs.WaitForWriters(waitForWritersDelay)
+
+			// After successful commit, VFS layer should show new name
+			_, err = vfs.Stat("newLeaf")
+			require.NoError(t, err)
+			_, err = vfs.Stat("dir/file1")
+			require.Error(t, err)
+
+			// Cache should be at new path now
+			require.True(t, vfs.cache.Exists("newLeaf"))
+			require.False(t, vfs.cache.Exists("dir/file1"))
+
+			// File node should be at new path
+			require.Equal(t, "newLeaf", file.Path())
+			require.Equal(t, "newLeaf", file.Name())
+
+			// Pending rename state should be cleared
+			require.False(t, file.HasPendingRename())
+		})
+	}
 }
