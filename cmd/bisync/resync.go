@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/rclone/rclone/cmd/bisync/bilib"
 	"github.com/rclone/rclone/fs"
@@ -43,9 +44,26 @@ func (b *bisyncRun) setResyncDefaults() {
 func (b *bisyncRun) resync(fctx context.Context) (err error) {
 	fs.Infof(nil, "Copying Path2 files to Path1")
 
+	// NOTE: We intentionally do NOT delete prior .lst-err markers or
+	// .lst-new/.lst-old/.que artifacts here. Stale diagnostic state from
+	// previous runs is preserved for debugging and is harmless for --resync
+	// (which ignores historical listings). Any leftover .lst-err will be
+	// overwritten cleanly by markFailed() if *this* run also fails, and
+	// stale listings/queues will be overwritten by the current run's own
+	// output files as it progresses.
+
 	// Save blank filelists (will be filled from sync results)
 	ls1 := newFileList()
 	ls2 := newFileList()
+	// Attach filters hash metadata so listings can be verified on next run
+	if b.filtersHash != "" {
+		ls1.meta.FiltersHash = b.filtersHash
+		ls1.meta.HasFiltersHash = true
+		ls2.meta.FiltersHash = b.filtersHash
+		ls2.meta.HasFiltersHash = true
+	}
+	ls1.meta.GeneratedAt = time.Now().In(TZ)
+	ls2.meta.GeneratedAt = time.Now().In(TZ)
 	err = ls1.save(b.newListing1)
 	if err != nil {
 		b.handleErr(ls1, "error saving ls1 from resync", err, true, true)

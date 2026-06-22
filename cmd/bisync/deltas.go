@@ -161,6 +161,20 @@ func (b *bisyncRun) findDeltas(fctx context.Context, f fs.Fs, oldListing string,
 		return
 	}
 
+	// Verify filters hash has not changed since prior listing was generated
+	// This catches cases where the filters file was modified but md5 was manually copied or bypassed
+	if b.filtersHash != "" && old.meta.HasFiltersHash && old.meta.FiltersHash != b.filtersHash {
+		if !b.opt.Resync {
+			fs.Errorf(nil, Color(terminal.RedFg, "Prior %s listing was generated with different filters than current run. Must run --resync to recover."), msg)
+			fs.Errorf(nil, Color(terminal.RedFg, "Prior filters hash: %s  Current: %s"), old.meta.FiltersHash, b.filtersHash)
+			b.critical = true
+			b.retryable = true
+			return nil, fmt.Errorf("filters mismatch detected between prior listing and current run")
+		} else {
+			fs.Infof(nil, Color(terminal.YellowFg, "Prior %s listing was generated with different filters, but --resync is set so proceeding."), msg)
+		}
+	}
+
 	err = b.checkListing(now, newListing, "current "+msg)
 	if err != nil {
 		return
@@ -256,16 +270,33 @@ func (b *bisyncRun) findDeltas(fctx context.Context, f fs.Fs, oldListing string,
 
 	for _, file := range now.list {
 		if !old.has(file) {
-			b.indent(msg, file, Color(terminal.GreenFg, "File is new"))
-			ds.deltas[file] = deltaNew
-			if b.opt.Compare.Size {
-				ds.size[file] = now.getSize(file)
+			// Check if this "new" file is actually just a case/unicode rename of a "deleted" file
+			// This prevents aliased renames (e.g. File.txt -> file.txt) from being
+			// mis-detected as delete + new, which would propagate as "delete on other side too"
+			alias := b.aliases.Alias(file)
+			foundAlias := false
+			if alias != file && old.has(alias) {
+				// Check if the "deleted" alias is in deltas (will be if old had it and now doesn't, under the old name)
+				if d, existed := ds.deltas[alias]; existed && d.is(deltaDeleted) {
+					// Do not add as new - it's an aliased rename handled by updateAliases/applyDeltas
+					fs.Debugf(file, "Suppressing spurious 'new' delta - is alias of deleted %s (case/unicode rename)", alias)
+					delete(ds.deltas, alias) // also remove the spurious delete
+					ds.deleted--
+					foundAlias = true
+				}
 			}
-			if b.opt.Compare.Modtime {
-				ds.time[file] = now.getTime(file)
-			}
-			if b.opt.Compare.Checksum {
-				ds.hash[file] = now.getHash(file)
+			if !foundAlias {
+				b.indent(msg, file, Color(terminal.GreenFg, "File is new"))
+				ds.deltas[file] = deltaNew
+				if b.opt.Compare.Size {
+					ds.size[file] = now.getSize(file)
+				}
+				if b.opt.Compare.Modtime {
+					ds.time[file] = now.getTime(file)
+				}
+				if b.opt.Compare.Checksum {
+					ds.hash[file] = now.getHash(file)
+				}
 			}
 		}
 	}
@@ -303,6 +334,11 @@ func (b *bisyncRun) applyDeltas(ctx context.Context, ds1, ds2 *deltaSet) (result
 
 	// update AliasMap for deleted files, as march does not know about them
 	b.updateAliases(ctx, ds1, ds2)
+
+	// Cross-validate aliases between ds1/ds2: detect case/unicode renames where
+	// one side shows as "deleted" but the other shows as "new/modified" under
+	// the aliased name. Without this, real file changes can be misinterpreted.
+	b.crossValidateAliasDeltas(ds1, ds2)
 
 	// efficient isDir check
 	// we load the listing just once and store only the dirs
@@ -440,23 +476,44 @@ func (b *bisyncRun) applyDeltas(ctx context.Context, ds1, ds2 *deltaSet) (result
 			d2, in2 := ds2.deltas[file]
 			// try looking under alternate name
 			fs.Debugf(file, "alias: %s, in2: %v", alias, in2)
+			foundViaAlias := false
 			if !in2 && file != alias {
 				fs.Debugf(file, "looking for alias: %s", alias)
 				d2, in2 = ds2.deltas[alias]
 				if in2 {
 					fs.Debugf(file, "detected alias: %s", alias)
+					foundViaAlias = true
 				}
 			}
 			if !in2 {
-				b.indent("Path2", p2, "Queue delete")
-				delete2.Add(file)
-				copy1to2.Add(file)
+				// Even when not in ds2 deltas at all, double-check via alias
+				// that Path2's current listing doesn't still have it under
+				// a different name. This guards against mid-sync rename states.
+				if alias != file && b.march.ls2.has(alias) {
+					fs.Infof(file,
+						Color(terminal.GreenFg, "Path1 says deleted but Path2 still has alias %q; treating as alias rename, not delete"),
+						alias)
+					handled.Add(file)
+					handled.Add(alias)
+				} else {
+					b.indent("Path2", p2, "Queue delete")
+					delete2.Add(file)
+					copy1to2.Add(file)
+				}
 			} else if d2.is(deltaOther) {
+				// Path1 has deletion but Path2 has modifications (under alias).
+				// This is almost certainly a case rename - keep the modified version.
+				key := file
+				if foundViaAlias {
+					key = alias
+				}
 				b.indent("Path2", p1, "Queue copy to Path1")
-				copy2to1.Add(file)
+				copy2to1.Add(key)
 				handled.Add(file)
+				handled.Add(alias)
 			} else if d2.is(deltaDeleted) {
 				handled.Add(file)
+				handled.Add(alias)
 				deletedonboth.Add(file)
 				deletedonboth.Add(alias)
 			}
@@ -620,4 +677,44 @@ func (b *bisyncRun) updateAliases(ctx context.Context, ds1, ds2 *deltaSet) {
 	}
 	addAliases(delMap1, fullMap2)
 	addAliases(delMap2, fullMap1)
+}
+
+// crossValidateAliasDeltas detects "rename by case/unicode" scenarios where the
+// deltaSets disagree due to alias mismatches:
+//
+//   - ds1 reports file A as deltaDeleted
+//   - ds2 reports file B (which is the alias of A) as deltaNew or deltaModified
+//
+// Without this fix, the code would propagate the deletion from ds1 to Path2,
+// losing the real modifications made on Path2.
+func (b *bisyncRun) crossValidateAliasDeltas(ds1, ds2 *deltaSet) {
+	// Sanity check: if both ds1 and ds2 have a file under different (aliased)
+	// names and one side says deleted while the other says new/modified,
+	// treat it as a rename case: drop the spurious delete delta.
+	fixOneSide := func(srcDs, dstDs *deltaSet, srcMsg, dstMsg string) {
+		for _, srcFile := range srcDs.sort() {
+			srcDelta := srcDs.deltas[srcFile]
+			if !srcDelta.is(deltaDeleted) {
+				continue
+			}
+			alias := b.aliases.Alias(srcFile)
+			if alias == srcFile {
+				continue
+			}
+			// Look up the alias in the opposite delta set
+			if dstDelta, ok := dstDs.deltas[alias]; ok && dstDelta.is(deltaOther) {
+				// Opposite side has changes for the aliased name.
+				// Drop the "deleted" marker on our side to avoid
+				// propagating a deletion that doesn't reflect reality.
+				fs.Infof(srcFile,
+					Color(terminal.GreenFg,
+						"Detected alias rename between %s (%s) and %s (%s); suppressing spurious delete delta on %s"),
+					srcFile, srcMsg, alias, dstMsg, srcMsg)
+				delete(srcDs.deltas, srcFile)
+				srcDs.deleted--
+			}
+		}
+	}
+	fixOneSide(ds1, ds2, "Path1", "Path2")
+	fixOneSide(ds2, ds1, "Path2", "Path1")
 }

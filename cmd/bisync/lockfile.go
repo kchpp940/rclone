@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -38,6 +39,11 @@ func (b *bisyncRun) setLockFile() (err error) {
 				errTip += fmt.Sprintf(Color(terminal.HiRedFg, "rclone deletefile \"%s\""), b.lockFile)
 				return fmt.Errorf(Color(terminal.RedFg, "prior lock file found: %s \n")+errTip, Color(terminal.HiYellowFg, b.lockFile))
 			}
+			// Lock file was expired - clean up its stale temp files
+			fs.Infof(nil, Color(terminal.GreenFg, "Cleaning up stale files from expired/interrupted prior run"))
+			b.cleanupStaleFiles()
+			// Also remove the expired lock file itself so we can recreate it cleanly
+			_ = os.Remove(b.lockFile)
 		}
 
 		pidStr := []byte(strconv.Itoa(os.Getpid()))
@@ -48,6 +54,12 @@ func (b *bisyncRun) setLockFile() (err error) {
 		b.renewLockFile()
 		b.lockFileOpt.stopRenewal = b.startLockRenewal()
 	}
+	// NOTE: stale files from prior runs are intentionally NOT deleted when a fresh
+	// lock is acquired. This preserves diagnostic artifacts (-new, -old, queues,
+	// etc.) across consecutive runs, and they will be overwritten or rotated
+	// naturally by the current run. Stale cleanup is reserved for:
+	//   - lock-file expiry (see above)
+	//   - explicit --resync invocation (see resync.go)
 	return nil
 }
 
@@ -157,10 +169,55 @@ func (b *bisyncRun) startLockRenewal() func() {
 	}
 }
 
+// markFailed renames the current listing file to an error marker so the
+// next run knows the previous run failed. It deliberately preserves
+// sibling files (-new, -old, -dry, -err, .que) so they can be
+// inspected for diagnosis and will be cleaned up by the next run's
+// setLockFile() / resync cleanup instead of being wiped eagerly.
 func markFailed(file string) {
 	failFile := file + "-err"
 	if bilib.FileExists(file) {
 		_ = os.Remove(failFile)
 		_ = os.Rename(file, failFile)
+	}
+}
+
+// cleanupStaleFiles removes any leftover temporary files from a prior interrupted run
+// Call this at the start of a new run (after lock acquired) or when lock expires
+func (b *bisyncRun) cleanupStaleFiles() {
+	patterns := []string{
+		b.listing1 + "-new",
+		b.listing1 + "-dry",
+		b.listing1 + "-dry-new",
+		b.listing1 + "-dry-old",
+		b.listing2 + "-new",
+		b.listing2 + "-dry",
+		b.listing2 + "-dry-new",
+		b.listing2 + "-dry-old",
+		b.basePath + ".copy1to2.que",
+		b.basePath + ".copy2to1.que",
+		b.basePath + ".delete1.que",
+		b.basePath + ".delete2.que",
+	}
+	for _, p := range patterns {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			fs.Debugf(nil, "cleanupStaleFiles: removing %q: %v", p, err)
+		}
+	}
+	// Clean up any stale .lst-dry* variants that might have been left over
+	if ls, err := filepath.Glob(b.basePath + "*.lst-dry*"); err == nil {
+		for _, f := range ls {
+			_ = os.Remove(f)
+		}
+	}
+	if ls, err := filepath.Glob(b.basePath + "*.lst-new"); err == nil {
+		for _, f := range ls {
+			_ = os.Remove(f)
+		}
+	}
+	if ls, err := filepath.Glob(b.basePath + "*.que"); err == nil {
+		for _, f := range ls {
+			_ = os.Remove(f)
+		}
 	}
 }

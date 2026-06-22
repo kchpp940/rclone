@@ -273,9 +273,6 @@ func (wb *WriteBack) Add(id Handle, name string, size int64, modified bool, putF
 	}
 	wbItem.putFn = putFn
 	wbItem.size = size
-	wbItem.name = name
-	// Remove any duplicate upload tasks for the same path
-	wb._removeDuplicatesByName(wbItem.id, name)
 	wb._resetTimer()
 	return wbItem.id
 }
@@ -315,9 +312,7 @@ func (wb *WriteBack) Remove(id Handle) (found bool) {
 // Rename should be called when a file might be uploading and it gains
 // a new name. This will cancel the upload and put it back in the
 // queue.
-//
-// If size is >= 0, the queued item size will also be updated.
-func (wb *WriteBack) Rename(id Handle, name string, size int64) {
+func (wb *WriteBack) Rename(id Handle, name string) {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
 
@@ -339,41 +334,10 @@ func (wb *WriteBack) Rename(id Handle, name string, size int64) {
 	}
 
 	wbItem.name = name
-	if size >= 0 {
-		wbItem.size = size
-	}
 	// Kick the timer on
 	wb.items._update(wbItem, wb._newExpiry())
 
 	wb._resetTimer()
-}
-
-// UpdateSize updates the size of a queued writeback item.
-//
-// It returns true if the item was found and updated, false otherwise.
-func (wb *WriteBack) UpdateSize(id Handle, size int64) bool {
-	wb.mu.Lock()
-	defer wb.mu.Unlock()
-
-	wbItem, ok := wb.lookup[id]
-	if !ok {
-		return false
-	}
-	wbItem.size = size
-	return true
-}
-
-// RemoveStaleByName removes any writeback items with the given name
-// whose id does not match keepID. Used to clean up duplicate upload
-// tasks for the same path.
-//
-// call with lock held
-func (wb *WriteBack) _removeDuplicatesByName(keepID Handle, name string) {
-	for existingID, existingItem := range wb.lookup {
-		if existingID != keepID && existingItem.name == name {
-			wb._remove(existingID)
-		}
-	}
 }
 
 // upload the item - called as a goroutine

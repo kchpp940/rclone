@@ -56,6 +56,7 @@ type bisyncRun struct {
 	queueOpt           bisyncQueueOpt
 	downloadHashOpt    downloadHashOpt
 	lockFileOpt        lockFileOpt
+	filtersHash        string // current md5 hash of the filters file (empty if none)
 }
 
 type queues struct {
@@ -168,6 +169,9 @@ func Bisync(ctx context.Context, fs1, fs2 fs.Fs, optArg *Options) (err error) {
 					}
 					markFailed(b.listing1)
 					markFailed(b.listing2)
+					// Do NOT clean up .lst-new/.lst-old/.que files here: they are
+					// preserved for diagnosis and for potential recovery, and will
+					// be removed by the next run's setLockFile() / resync cleanup.
 				}
 				err = b.removeLockFile()
 			}
@@ -199,13 +203,17 @@ func Bisync(ctx context.Context, fs1, fs2 fs.Fs, optArg *Options) (err error) {
 		if b.retryable && b.opt.Resilient && !b.opt.Resync {
 			fs.Errorf(nil, Color(terminal.RedFg, "Bisync critical error: %v"), err)
 			fs.Error(nil, Color(terminal.YellowFg, "Bisync aborted. Error is retryable without --resync due to --resilient mode."))
+			// Resilient mode: leave stale files for next run to clean up in
+			// setLockFile(), preserving diagnostic artifacts rather than
+			// wiping them eagerly.
 		} else {
-			if bilib.FileExists(b.listing1) {
-				_ = os.Rename(b.listing1, b.listing1+"-err")
-			}
-			if bilib.FileExists(b.listing2) {
-				_ = os.Rename(b.listing2, b.listing2+"-err")
-			}
+			// Use markFailed instead of raw Rename so we also purge
+			// .lst-new, -dry, -old, and .que files that could confuse the next run
+			markFailed(b.listing1)
+			markFailed(b.listing2)
+			// Do NOT call cleanupStaleFiles() here: stale listings, queues,
+			// and partials are left as-is for diagnosis. The next successful
+			// run acquires the lock and setLockFile() / resync will sweep.
 			fs.Errorf(nil, Color(terminal.RedFg, "Bisync critical error: %v"), err)
 			fs.Error(nil, Color(terminal.RedFg, "Bisync aborted. Must run --resync to recover."))
 		}
@@ -255,11 +263,13 @@ func (b *bisyncRun) runLocked(octx context.Context) (err error) {
 
 	// Create second context with filters
 	var fctx context.Context
-	if fctx, err = b.opt.applyFilters(octx); err != nil {
+	var fr applyFiltersResult
+	if fctx, err = b.opt.applyFilters(octx, &fr); err != nil {
 		b.critical = true
 		b.retryable = true
 		return
 	}
+	b.filtersHash = fr.filtersHash
 	b.octx = octx
 	b.fctx = fctx
 

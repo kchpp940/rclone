@@ -60,6 +60,15 @@ func (b *bisyncRun) makeMarchListing(ctx context.Context) (*fileList, *fileList,
 	if b.opt.Compare.DownloadHash && b.march.ls2.hash == hash.None {
 		b.march.ls2.hash = hash.MD5
 	}
+	// Attach current filtersHash metadata to listings so we can detect filter changes
+	if b.filtersHash != "" {
+		b.march.ls1.meta.FiltersHash = b.filtersHash
+		b.march.ls1.meta.HasFiltersHash = true
+		b.march.ls2.meta.FiltersHash = b.filtersHash
+		b.march.ls2.meta.HasFiltersHash = true
+	}
+	b.march.ls1.meta.GeneratedAt = time.Now().In(TZ)
+	b.march.ls2.meta.GeneratedAt = time.Now().In(TZ)
 	b.march.err = b.march.ls1.save(b.newListing1)
 	b.handleErr(b.march.ls1, "error saving b.march.ls1 from march", b.march.err, true, true)
 	b.march.err = b.march.ls2.save(b.newListing2)

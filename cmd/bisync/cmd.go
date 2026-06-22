@@ -226,9 +226,20 @@ func (opt *Options) setDryRun(ctx context.Context) context.Context {
 	return ctxNew
 }
 
-func (opt *Options) applyFilters(ctx context.Context) (context.Context, error) {
+// applyFiltersResult captures extra data from applyFilters that bisyncRun needs
+type applyFiltersResult struct {
+	filtersHash string
+}
+
+func (opt *Options) applyFilters(ctx context.Context, extraResults ...*applyFiltersResult) (context.Context, error) {
 	filtersFile := opt.FiltersFile
 	if filtersFile == "" {
+		// Still clear out any stale results
+		for _, xr := range extraResults {
+			if xr != nil {
+				xr.filtersHash = ""
+			}
+		}
 		return ctx, nil
 	}
 
@@ -245,6 +256,13 @@ func (opt *Options) applyFilters(ctx context.Context) (context.Context, error) {
 	}
 	gotHash := hex.EncodeToString(hasher.Sum(nil))
 	_ = f.Close()
+
+	// Save the current hash for later
+	for _, xr := range extraResults {
+		if xr != nil {
+			xr.filtersHash = gotHash
+		}
+	}
 
 	hashFile := filtersFile + ".md5"
 	wantHash, err := os.ReadFile(hashFile)

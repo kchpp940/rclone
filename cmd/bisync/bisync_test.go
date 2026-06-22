@@ -1731,7 +1731,9 @@ func (b *bisyncTest) mangleListing(text string, golden bool, file string) string
 	lines := strings.Split(text, eol)
 
 	hasHeader := len(lines) > 0 && strings.HasPrefix(lines[0], bisync.ListingHeader)
-	if hasHeader {
+
+	// Skip all comment/metadata lines at the top of the listing
+	for len(lines) > 0 && len(lines[0]) > 0 && lines[0][0] == '#' {
 		lines = lines[1:]
 	}
 

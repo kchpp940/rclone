@@ -431,20 +431,12 @@ func (item *Item) Exists() bool {
 func (item *Item) _dirty() {
 	item.info.ModTime = time.Now()
 	item.info.ATime = item.info.ModTime
-
-	// Cancel any in-progress upload and update the queued size when
-	// the file is marked dirty. Use Rename() instead of Remove()+UpdateSize()
-	// because Remove() deletes the queue entry, so UpdateSize() on a removed
-	// id is a no-op. Rename() keeps the entry in the queue, cancels the
-	// upload if running, updates the size and resets the expiry timer.
-	item.modified = true
-	id := item.writeBackID
-	newSize := item.info.Size
-	currentName := item.name
-	item.mu.Unlock()
-	item.c.writeback.Rename(id, currentName, newSize)
-	item.mu.Lock()
-
+	if !item.modified {
+		item.modified = true
+		item.mu.Unlock()
+		item.c.writeback.Remove(item.writeBackID)
+		item.mu.Lock()
+	}
 	if !item.info.Dirty {
 		item.info.Dirty = true
 		err := item._save()
@@ -1496,110 +1488,38 @@ func (item *Item) Sync() (err error) {
 }
 
 // rename the item
-//
-// This atomically updates the cache file path, metadata path, item name,
-// remote object, fingerprint, and cancels/re-queues any in-progress
-// writeback with the new name and size.
-//
-// On failure, all changes are rolled back so the item remains in its
-// original state with no ghost files or duplicate upload tasks.
 func (item *Item) rename(name string, newName string, newObj fs.Object) (err error) {
 	item.preAccess()
 	defer item.postAccess()
 	item.mu.Lock()
 
-	// --- Save original state for rollback ---
-	origName := item.name
-	origObj := item.o
-	origFingerprint := item.info.Fingerprint
-	origDownloaders := item.downloaders
-	id := item.writeBackID
-	var origDirty bool
-	var newSize int64
-
-	// Stop downloaders early - they reference the old name
+	// stop downloader
+	downloaders := item.downloaders
 	item.downloaders = nil
 
-	dataOSPathOld := item.c.toOSPath(name)
-	dataOSPathNew := item.c.toOSPath(newName)
-	metaOSPathOld := item.c.toOSPathMeta(name)
-	metaOSPathNew := item.c.toOSPathMeta(newName)
+	// id for writeback cancel
+	id := item.writeBackID
 
-	// --- Check what exists on disk before making changes ---
-	dataExisted := false
-	if _, statErr := os.Stat(dataOSPathOld); statErr == nil {
-		dataExisted = true
-	}
-	metaExisted := false
-	if _, statErr := os.Stat(metaOSPathOld); statErr == nil {
-		metaExisted = true
-	}
-
-	// Track which OS operations succeeded so we can roll them back
-	dataRenamed := false
-	metaRenamed := false
-
-	// --- Perform OS operations first (these can fail) ---
-
-	// Rename data cache file if it exists
-	if dataExisted {
-		err = rename(dataOSPathOld, dataOSPathNew)
-		if err != nil {
-			fs.Errorf(name, "vfs cache: failed to rename data file %q -> %q: %v", dataOSPathOld, dataOSPathNew, err)
-			goto rollback
-		}
-		dataRenamed = true
-	}
-
-	// Rename metadata cache file if it exists
-	if metaExisted {
-		err = rename(metaOSPathOld, metaOSPathNew)
-		if err != nil {
-			fs.Errorf(name, "vfs cache: failed to rename meta file %q -> %q: %v", metaOSPathOld, metaOSPathNew, err)
-			goto rollback
-		}
-		metaRenamed = true
-	}
-
-	// --- All OS operations succeeded; now update in-memory state ---
+	// Set internal state
 	item.name = newName
 	item.o = newObj
-	origDirty = item.info.Dirty
 	item._updateFingerprint()
-	newSize = item.info.Size
+
+	// Rename cache file if it exists
+	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
+
+	// Rename meta file if it exists
+	err2 := rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
+	if err2 != nil {
+		err = err2
+	}
 
 	item.mu.Unlock()
 
-	// --- Close old downloaders (with item.mu unlocked per lock ordering) ---
-	if origDownloaders != nil {
-		_ = origDownloaders.Close(nil)
+	// close downloader and cancel writebacks with mutex unlocked
+	if downloaders != nil {
+		_ = downloaders.Close(nil)
 	}
-
-	// --- Cancel/re-queue writeback with new name and size ---
-	item.c.writeback.Rename(id, newName, newSize)
-
-	fs.Infof(origName, "vfs cache: renamed in cache to %q (dirty=%v)", newName, origDirty)
-	return nil
-
-rollback:
-	// Roll back OS renames in reverse order
-	if metaRenamed {
-		if rbErr := rename(metaOSPathNew, metaOSPathOld); rbErr != nil {
-			fs.Errorf(origName, "vfs cache: rollback failed to restore meta file %q: %v", metaOSPathOld, rbErr)
-		}
-	}
-	if dataRenamed {
-		if rbErr := rename(dataOSPathNew, dataOSPathOld); rbErr != nil {
-			fs.Errorf(origName, "vfs cache: rollback failed to restore data file %q: %v", dataOSPathOld, rbErr)
-		}
-	}
-
-	// Restore in-memory state
-	item.name = origName
-	item.o = origObj
-	item.info.Fingerprint = origFingerprint
-	item.downloaders = origDownloaders
-
-	item.mu.Unlock()
+	item.c.writeback.Rename(id, newName)
 	return err
 }

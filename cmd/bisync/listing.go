@@ -27,6 +27,9 @@ import (
 // ListingHeader defines first line of a listing
 const ListingHeader = "# bisync listing v1 from"
 
+// ListingMetaHeaderPrefix defines the prefix of optional second line with metadata
+const ListingMetaHeaderPrefix = "# bisync meta"
+
 // lineRegex and lineFormat define listing line format
 //
 //	flags <- size -> <- hash -> id <------------ modtime -----------> "<----- remote"
@@ -41,6 +44,55 @@ var lineRegex = regexp.MustCompile(`^(\S) +(-?\d+) (\S+) (\S+) (\d{4}-\d\d-\d\dT
 
 // timeFormat defines time format used in listings
 const timeFormat = "2006-01-02T15:04:05.000000000-0700"
+
+// listingMeta stores metadata embedded in the listing file header
+type listingMeta struct {
+	FiltersHash    string    // md5 hash of filters file (if used)
+	GeneratedAt    time.Time // when listing was generated
+	HasFiltersHash bool      // whether FiltersHash was explicitly set
+}
+
+// parseListingMeta parses the meta line from a listing header
+// format: "# bisync meta filtersHash:abc123 generatedAt:2024-..."
+func parseListingMeta(line string) listingMeta {
+	m := listingMeta{}
+	prefix := ListingMetaHeaderPrefix + " "
+	if !strings.HasPrefix(line, prefix) {
+		return m
+	}
+	rest := strings.TrimPrefix(line, prefix)
+	fields := strings.Fields(rest)
+	for _, f := range fields {
+		if key, val, ok := strings.Cut(f, ":"); ok {
+			switch key {
+			case "filtersHash":
+				m.FiltersHash = val
+				m.HasFiltersHash = true
+			case "generatedAt":
+				if t, err := time.ParseInLocation(timeFormat, val, TZ); err == nil {
+					m.GeneratedAt = t
+				}
+			}
+		}
+	}
+	return m
+}
+
+// formatListingMeta formats metadata as a header line.
+// Returns "" if there is no metadata to record.
+func formatListingMeta(m listingMeta) string {
+	parts := []string{}
+	if m.HasFiltersHash {
+		parts = append(parts, "filtersHash:"+m.FiltersHash)
+	}
+	if !m.GeneratedAt.IsZero() {
+		parts = append(parts, "generatedAt:"+m.GeneratedAt.In(TZ).Format(timeFormat))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ListingMetaHeaderPrefix + " " + strings.Join(parts, " ")
+}
 
 var (
 	// TZ defines time zone used in listings
@@ -66,6 +118,7 @@ type fileList struct {
 	list []string
 	info map[string]*fileInfo
 	hash hash.Type
+	meta listingMeta
 }
 
 func newFileList() *fileList {
@@ -259,11 +312,26 @@ func (ls *fileList) save(listing string) error {
 		hashName = ls.hash.String()
 	}
 
+	// Ensure GeneratedAt is set if not already
+	if ls.meta.GeneratedAt.IsZero() {
+		ls.meta.GeneratedAt = time.Now().In(TZ)
+	}
+
 	_, err = fmt.Fprintf(file, "%s %s\n", ListingHeader, time.Now().In(TZ).Format(timeFormat))
 	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(listing)
 		return err
+	}
+
+	// Write metadata line if we have any
+	if ls.meta.HasFiltersHash || !ls.meta.GeneratedAt.IsZero() {
+		_, err = fmt.Fprintf(file, "%s\n", formatListingMeta(ls.meta))
+		if err != nil {
+			_ = file.Close()
+			_ = os.Remove(listing)
+			return err
+		}
 	}
 
 	for _, remote := range ls.list {
@@ -322,7 +390,14 @@ func (b *bisyncRun) loadListing(listing string) (*fileList, error) {
 		}
 
 		line = strings.TrimSuffix(line, "\n")
-		if line == "" || line[0] == '#' {
+		if line == "" {
+			continue
+		}
+		if line[0] == '#' {
+			// Try parsing metadata from comment lines
+			if strings.HasPrefix(line, ListingMetaHeaderPrefix) {
+				ls.meta = parseListingMeta(line)
+			}
 			continue
 		}
 
