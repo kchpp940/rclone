@@ -487,7 +487,40 @@ func rcQueue(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if vfs.cache == nil {
 		return nil, nil
 	}
-	return vfs.cache.Queue(), nil
+	out = vfs.cache.Queue()
+
+	// Build a map of oldPath -> newPath for files with pending rename.
+	// During pending rename, the VFS layer shows the new path (POSIX
+	// semantics), but the cache/writeback layer still references the
+	// old path. Translate queue display names so RC queries are
+	// consistent with VFS directory listings.
+	pendingRenameMap := make(map[string]string)
+	vfs.root.walk(func(d *Dir) {
+		for _, n := range d.items {
+			if f, ok := n.(*File); ok {
+				if f.HasPendingRename() {
+					f.mu.RLock()
+					if f.pendingRename != nil {
+						pendingRenameMap[f.pendingRename.oldPath] = f.Path()
+					}
+					f.mu.RUnlock()
+				}
+			}
+		}
+	})
+
+	if len(pendingRenameMap) > 0 {
+		if queue, ok := out["queue"].([]writeback.QueueInfo); ok {
+			for i := range queue {
+				if newName, mapped := pendingRenameMap[queue[i].Name]; mapped {
+					queue[i].Name = newName
+				}
+			}
+			out["queue"] = queue
+		}
+	}
+
+	return out, nil
 }
 
 func init() {

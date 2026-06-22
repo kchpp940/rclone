@@ -432,16 +432,17 @@ func (item *Item) _dirty() {
 	item.info.ModTime = time.Now()
 	item.info.ATime = item.info.ModTime
 
-	// Always cancel any in-progress upload and update the queued
-	// size when the file is marked dirty. This ensures that even
-	// for repeated modifications (e.g. truncate shrinking the file),
-	// the upload queue never contains stale data or stale size.
+	// Cancel any in-progress upload and update the queued size when
+	// the file is marked dirty. Use Rename() instead of Remove()+UpdateSize()
+	// because Remove() deletes the queue entry, so UpdateSize() on a removed
+	// id is a no-op. Rename() keeps the entry in the queue, cancels the
+	// upload if running, updates the size and resets the expiry timer.
 	item.modified = true
 	id := item.writeBackID
 	newSize := item.info.Size
+	currentName := item.name
 	item.mu.Unlock()
-	item.c.writeback.Remove(id)
-	item.c.writeback.UpdateSize(id, newSize)
+	item.c.writeback.Rename(id, currentName, newSize)
 	item.mu.Lock()
 
 	if !item.info.Dirty {

@@ -13,6 +13,7 @@ import (
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/mockfs"
 	"github.com/rclone/rclone/fstest/mockobject"
+	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -528,6 +529,183 @@ func TestFileRenamePendingRollback(t *testing.T) {
 
 			// Pending rename state should be cleared
 			require.False(t, file.HasPendingRename())
+		})
+	}
+}
+
+// TestFileTruncateWritebackSize tests that after truncating a dirty file,
+// the writeback queue size is updated and old in-progress uploads are cancelled.
+// This verifies that we never upload stale size content.
+func TestFileTruncateWritebackSize(t *testing.T) {
+	for _, mode := range []vfscommon.CacheMode{
+		vfscommon.CacheModeWrites,
+		vfscommon.CacheModeFull,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			r, vfs, file, _ := fileCreate(t, mode)
+			_ = r
+			itemPath := file.Path()
+
+			// Write a larger amount of data
+			h, err := file.Open(os.O_WRONLY)
+			require.NoError(t, err)
+			largeData := make([]byte, 100*1024)
+			for i := range largeData {
+				largeData[i] = 'A'
+			}
+			_, err = h.Write(largeData)
+			require.NoError(t, err)
+			err = h.Close()
+			require.NoError(t, err)
+
+			// Verify cache item exists at 100KB size
+			require.True(t, vfs.cache.Exists(itemPath))
+			isDirty, dirtySize := vfs.cache.StatDirty(itemPath)
+			require.True(t, isDirty)
+			require.Equal(t, int64(100*1024), dirtySize)
+
+			// Check queue has the item with 100KB size
+			queueOut := vfs.cache.Queue()
+			queue, ok := queueOut["queue"].([]writeback.QueueInfo)
+			require.True(t, ok)
+			found := false
+			for _, qi := range queue {
+				if qi.Name == itemPath {
+					require.Equal(t, int64(100*1024), qi.Size, "queued size should be 100KB before truncate")
+					found = true
+				}
+			}
+			require.True(t, found, "item should be in upload queue before truncate")
+
+			// Re-open and truncate to 10KB
+			h, err = file.Open(os.O_WRONLY)
+			require.NoError(t, err)
+			err = h.Truncate(10 * 1024)
+			require.NoError(t, err)
+			err = h.Close()
+			require.NoError(t, err)
+
+			// Verify queue size is updated to 10KB
+			queueOut = vfs.cache.Queue()
+			queue, ok = queueOut["queue"].([]writeback.QueueInfo)
+			require.True(t, ok)
+			found = false
+			for _, qi := range queue {
+				if qi.Name == itemPath {
+					require.Equal(t, int64(10*1024), qi.Size, "queued size should be updated to 10KB after truncate")
+					found = true
+				}
+			}
+			require.True(t, found, "item should still be in upload queue after truncate")
+
+			// Wait for writeback to complete and verify file size on remote
+			vfs.WaitForWriters(waitForWritersDelay)
+			stat, err := vfs.Stat(itemPath)
+			require.NoError(t, err)
+			require.Equal(t, int64(10*1024), stat.Size())
+		})
+	}
+}
+
+// TestFileRenameTruncateClose tests the interleaved scenario:
+// 1. Open writer, write data
+// 2. While writer is open, rename file (triggers pending rename)
+// 3. While writer is still open, truncate the file
+// 4. Close writer -> apply pending rename + upload new size
+//
+// This verifies that rename+truncate+close interleaving leaves
+// consistent VFS state, cache files, and writeback queue entries.
+func TestFileRenameTruncateClose(t *testing.T) {
+	for _, mode := range []vfscommon.CacheMode{
+		vfscommon.CacheModeWrites,
+		vfscommon.CacheModeFull,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			r, vfs, file, _ := fileCreate(t, mode)
+
+			if !operations.CanServerSideMove(r.Fremote) {
+				t.Skip("skip as can't rename files")
+			}
+
+			rootDir, err := vfs.Root()
+			require.NoError(t, err)
+			dir := file.Dir()
+
+			oldPath := file.Path()
+			oldLeaf := file.Name()
+
+			// Step 1: Open writer and write some data (50KB)
+			h, err := file.Open(os.O_WRONLY | os.O_TRUNC)
+			require.NoError(t, err)
+			initialData := make([]byte, 50*1024)
+			for i := range initialData {
+				initialData[i] = 'B'
+			}
+			_, err = h.Write(initialData)
+			require.NoError(t, err)
+
+			// Step 2: Rename while writer is open -> pending rename
+			newLeaf := "renamed_truncated_file"
+			err = dir.Rename(oldLeaf, newLeaf, rootDir)
+			require.NoError(t, err)
+			newPath := file.Path()
+			require.Equal(t, newLeaf, file.Name())
+
+			// VFS should show new path immediately
+			_, err = vfs.Stat(newLeaf)
+			require.NoError(t, err)
+			_, err = vfs.Stat(oldPath)
+			require.Error(t, err)
+
+			// Pending rename active
+			require.True(t, file.HasPendingRename())
+
+			// Cache item still at old path (pending rename not applied)
+			require.True(t, vfs.cache.Exists(oldPath))
+			require.False(t, vfs.cache.Exists(newPath))
+
+			// Step 3: Truncate while still have open writer + pending rename
+			err = h.Truncate(20 * 1024) // Shrink from 50KB to 20KB
+			require.NoError(t, err)
+
+			// Step 4: Close writer -> triggers applyPendingRename + queued upload
+			err = h.Close()
+			require.NoError(t, err)
+
+			// Wait for pending rename to be applied
+			vfs.WaitForWriters(waitForWritersDelay)
+
+			// After apply: pending rename cleared
+			require.False(t, file.HasPendingRename())
+
+			// Cache item moved to new path
+			require.False(t, vfs.cache.Exists(oldPath))
+			require.True(t, vfs.cache.Exists(newPath))
+
+			// VFS layer still shows new path
+			_, err = vfs.Stat(newLeaf)
+			require.NoError(t, err)
+			_, err = vfs.Stat(oldPath)
+			require.Error(t, err)
+
+			// Check queue shows new path (not old) and correct size
+			queueOut := vfs.cache.Queue()
+			if queue, ok := queueOut["queue"].([]writeback.QueueInfo); ok {
+				for _, qi := range queue {
+					require.NotEqual(t, oldPath, qi.Name, "queue should never reference old path after rename applied")
+					if qi.Name == newPath {
+						require.Equal(t, int64(20*1024), qi.Size)
+					}
+				}
+			}
+
+			// Wait for writeback to complete
+			vfs.WaitForWriters(waitForWritersDelay)
+
+			// Final state: file exists at new path with 20KB size
+			stat, err := vfs.Stat(newLeaf)
+			require.NoError(t, err)
+			require.Equal(t, int64(20*1024), stat.Size())
 		})
 	}
 }
