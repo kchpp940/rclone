@@ -288,16 +288,15 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 		return nil, errors.New("can't point remote at itself - check the value of the remote setting")
 	}
 
-	// Look for a file first using the unified path joining function
-	remotePath := fspath.JoinRootPath(remote, rpath)
-	baseFs, err := cache.Get(ctx, remotePath)
-	if err != fs.ErrorIsFile && err != nil {
-		return nil, fmt.Errorf("failed to make remote %q to wrap: %w", remotePath, err)
-	}
-	// Parse the remote path to get components for later use
-	_, basePath, err := fspath.SplitFs(remote)
+	baseName, basePath, err := fspath.SplitFs(remote)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse remote %q to wrap: %w", remote, err)
+	}
+	// Look for a file first
+	remotePath := fspath.JoinRootPath(basePath, rpath)
+	baseFs, err := cache.Get(ctx, baseName+remotePath)
+	if err != fs.ErrorIsFile && err != nil {
+		return nil, fmt.Errorf("failed to make remote %q to wrap: %w", baseName+remotePath, err)
 	}
 	if !operations.CanServerSideMove(baseFs) {
 		return nil, errors.New("can't use chunker on a backend which doesn't support server-side move or copy")
@@ -321,9 +320,8 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 	// detects a composite file because it finds the first chunk!
 	// (yet can't satisfy fstest.CheckListing, will ignore)
 	if err == nil && !f.useMeta {
-		firstChunkPath := f.makeChunkName(basePath, 0, "", "")
-		firstChunkFullPath := fspath.JoinRootPath(remote, firstChunkPath)
-		newBase, testErr := cache.Get(ctx, firstChunkFullPath)
+		firstChunkPath := f.makeChunkName(remotePath, 0, "", "")
+		newBase, testErr := cache.Get(ctx, baseName+firstChunkPath)
 		if testErr == fs.ErrorIsFile {
 			f.base = newBase
 			err = testErr

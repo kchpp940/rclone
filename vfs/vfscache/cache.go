@@ -52,6 +52,7 @@ type Cache struct {
 	hashOption *fs.HashesOption     // corresponding OpenOption
 	writeback  *writeback.WriteBack // holds Items for writeback
 	avFn       AddVirtualFn         // if set, can be called to add dir entries
+	dvFn       DelVirtualFn         // if set, can be called to remove dir entries
 
 	mu            sync.Mutex       // protects the following variables
 	cond          sync.Cond        // cond lock for synchronous cache cleaning
@@ -72,6 +73,11 @@ type Cache struct {
 // This is used when reloading the Cache and uploading items need to
 // go into the directory tree.
 type AddVirtualFn func(remote string, size int64, isDir bool) error
+
+// DelVirtualFn if registered, can be called to remove a virtual entry
+// from directory listings.
+
+type DelVirtualFn func(remote string) error
 
 // New creates a new cache hierarchy for fremote
 //
@@ -345,6 +351,18 @@ func (c *Cache) DirtyItem(name string) (item *Item) {
 	return item
 }
 
+// StatDirty returns whether the named cache item is dirty, and its
+// current size. If the item does not exist it returns (false, 0).
+func (c *Cache) StatDirty(name string) (isDirty bool, size int64) {
+	item := c.DirtyItem(name)
+	if item == nil {
+		return false, 0
+	}
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return true, item.info.Size
+}
+
 // get gets a file name from the cache or creates a new one
 //
 // It returns the item and found as to whether this item was found in
@@ -418,20 +436,60 @@ func rename(osOldPath, osNewPath string) error {
 }
 
 // Rename the item in cache
+//
+// This performs the rename atomically across the cache item, the cache
+// map index, the upload queue, and (if registered) the VFS virtual
+// directory entries. On failure the state is fully rolled back so no
+// ghost cache files, stale map entries, or duplicate upload tasks are
+// left behind.
 func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error) {
-	item, _ := c.get(name)
+	name = clean(name)
+	newName = clean(newName)
+	if name == newName {
+		return nil
+	}
+
+	item, found := c.get(name)
+	if !found {
+		return nil
+	}
+
+	// Snapshot the size for the virtual dir entry update
+	item.mu.Lock()
+	itemSize := item.info.Size
+	itemDirty := item.info.Dirty
+	item.mu.Unlock()
+
+	// Perform the item-level rename (cache files, metadata, item state, upload queue)
 	err = item.rename(name, newName, newObj)
 	if err != nil {
 		return err
 	}
 
-	// Move the item in the cache
+	// Move the item in the cache map atomically
 	c.mu.Lock()
-	if item, ok := c.item[name]; ok {
+	if existing, ok := c.item[name]; ok && existing == item {
 		c.item[newName] = item
 		delete(c.item, name)
 	}
+	// If a different item somehow exists at newName, keep the
+	// newly-renamed one - it reflects the latest filesystem state.
+	if _, exists := c.item[newName]; !exists {
+		c.item[newName] = item
+	}
 	c.mu.Unlock()
+
+	// If virtual entries are registered, reflect the rename in the
+	// VFS directory listings so callers never see stale paths.
+	if c.avFn != nil && itemDirty {
+		// Remove the old virtual entry (ignore errors - it may not
+		// have been added yet)
+		_ = c.RemoveVirtual(name)
+		// Add the new virtual entry at the new path
+		if avErr := c.AddVirtual(newName, itemSize, false); avErr != nil {
+			fs.Errorf(newName, "vfs cache: rename: failed to add virtual dir entry: %v", avErr)
+		}
+	}
 
 	fs.Infof(name, "vfs cache: renamed in cache to %q", newName)
 	return nil
@@ -901,4 +959,18 @@ func (c *Cache) AddVirtual(remote string, size int64, isDir bool) error {
 		return errors.New("no AddVirtual function registered")
 	}
 	return c.avFn(remote, size, isDir)
+}
+
+// SetDelVirtual registers a callback used to remove virtual directory entries.
+func (c *Cache) SetDelVirtual(dvFn DelVirtualFn) {
+	c.dvFn = dvFn
+}
+
+// RemoveVirtual removes a virtual directory entry by calling the delVirtual
+// callback if one has been registered.
+func (c *Cache) RemoveVirtual(remote string) error {
+	if c.dvFn == nil {
+		return errors.New("no DelVirtual function registered")
+	}
+	return c.dvFn(remote)
 }

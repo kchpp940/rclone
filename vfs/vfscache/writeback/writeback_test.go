@@ -601,10 +601,10 @@ func TestWriteBackMaxQueue(t *testing.T) {
 
 	// put toTransfer things in the queue
 	pis := []*putItem{}
-	for range toTransfer {
+	for i := range toTransfer {
 		pi := newPutItem(t)
 		pis = append(pis, pi)
-		wb.Add(0, fmt.Sprintf("number%d", 1), 10, true, pi.put)
+		wb.Add(0, fmt.Sprintf("number%d", i), 10, true, pi.put)
 	}
 
 	inProgress, queued := wb.Stats()
@@ -645,7 +645,7 @@ func TestWriteBackRename(t *testing.T) {
 	defer cancel()
 
 	// cancel when not in writeback
-	wb.Rename(1, "nonExistent")
+	wb.Rename(1, "nonExistent", -1)
 
 	// add item
 	pi1 := newPutItem(t)
@@ -656,7 +656,7 @@ func TestWriteBackRename(t *testing.T) {
 	assert.Equal(t, wbItem.name, "one")
 
 	// rename when not uploading
-	wb.Rename(id, "two")
+	wb.Rename(id, "two", -1)
 	checkOnHeap(t, wb, wbItem)
 	checkInLookup(t, wb, wbItem)
 	assert.False(t, pi1.cancelled)
@@ -676,7 +676,7 @@ func TestWriteBackRename(t *testing.T) {
 	checkInLookup(t, wb, wbItem)
 
 	// rename when uploading - goes back on heap
-	wb.Rename(id, "three")
+	wb.Rename(id, "three", -1)
 	checkOnHeap(t, wb, wbItem)
 	checkInLookup(t, wb, wbItem)
 	assert.True(t, pi2.cancelled)
@@ -714,7 +714,7 @@ func TestWriteBackRenameDuplicates(t *testing.T) {
 	checkInLookup(t, wb, wbItem2)
 
 	// rename "two" to "one"
-	wb.Rename(id2, "one")
+	wb.Rename(id2, "one", -1)
 
 	// check "one" is cancelled and removed from heap and lookup
 	checkNotOnHeap(t, wb, wbItem1)

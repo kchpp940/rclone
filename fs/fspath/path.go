@@ -12,76 +12,6 @@ import (
 	"github.com/rclone/rclone/fs/driveletter"
 )
 
-// ResolveMode controls how ambiguous paths like "foo:bar" are resolved when
-// the name doesn't match any known remote.
-type ResolveMode int
-
-const (
-	// RemoteFirst preserves remote:path resolution for unknown names.
-	// Used by CLI and RC entry points so that typos like "drivedata:/"
-	// produce a clear "remote not found" error instead of silently
-	// falling back to a local file named "drivedata:/".
-	RemoteFirst ResolveMode = iota
-
-	// LocalFirst falls back to local path resolution for unknown names
-	// when a LocalPathExists check confirms the path exists, or when
-	// explicitly requested by the caller.
-	LocalFirst
-)
-
-// ResolveOptions provides context for resolving ambiguous paths like "foo:bar"
-type ResolveOptions struct {
-	KnownRemotes    map[string]bool        // Set of known remote names
-	Mode            ResolveMode            // How to resolve unknown names
-	LocalPathExists func(path string) bool // Optional: check if a local path actually exists
-}
-
-// ResolveWithOptions parses path with additional context to resolve ambiguities.
-//
-// This is the preferred entry point for parsing paths, as it can distinguish
-// between "foo:bar" as a remote:path or a local filename based on context.
-//
-// Rules (highest priority first):
-//  1. UNC paths (//server/share or \\server\share) → local path
-//  2. Explicit local prefix (/ or ./ or .\) → local path
-//  3. Windows drive paths (C:\, C:/, C:) → local path (Windows only)
-//  4. On-the-fly remote (:type:) → remote
-//  5. Name matches KnownRemotes → remote:path
-//  6. Name doesn't match KnownRemotes:
-//     - RemoteFirst mode (CLI/RC default): keep remote:path, let caller report error
-//     - LocalFirst mode: if LocalPathExists is provided and returns true → local path;
-//     otherwise keep remote:path, let caller report error
-func ResolveWithOptions(path string, opt ResolveOptions) (parsed Parsed, err error) {
-	parsed, err = Parse(path)
-	if err != nil {
-		return parsed, err
-	}
-
-	if parsed.Name == "" {
-		return parsed, nil
-	}
-
-	if strings.HasPrefix(parsed.Name, ":") {
-		return parsed, nil
-	}
-
-	if opt.KnownRemotes != nil && opt.KnownRemotes[parsed.Name] {
-		return parsed, nil
-	}
-
-	if opt.Mode == LocalFirst {
-		if opt.LocalPathExists != nil && opt.LocalPathExists(path) {
-			parsed.Name = ""
-			parsed.ConfigString = ""
-			parsed.Config = nil
-			parsed.Path = filepath.ToSlash(path)
-			return parsed, nil
-		}
-	}
-
-	return parsed, nil
-}
-
 const (
 	configNameRe              = `[\w\p{L}\p{N}.+@]+(?:[ -]+[\w\p{L}\p{N}.+@-]+)*` // May contain Unicode numbers and letters, as well as `_` (covered by \w), `-`, `.`, `+`, `@` and space, but not start with `-` (it complicates usage, see #4261) or space, and not end with space
 	illegalPartOfConfigNameRe = `^[ -]+|[^\w\p{L}\p{N}.+@ -]+|[ ]+$`
@@ -186,25 +116,6 @@ func Parse(path string) (parsed Parsed, err error) {
 	if !strings.ContainsRune(path, ':') {
 		return parsed, nil
 	}
-	// Check for UNC paths first - these always start with // or \\
-	// This applies to all platforms
-	if driveletter.IsUNCPath(path) {
-		return parsed, nil
-	}
-	// If path starts with / or . followed by / or \ then it's an explicit local path
-	// even if it contains a : later, e.g. "/path:/to/file" or "./:colon.txt"
-	// This applies to all platforms
-	if len(path) >= 1 && (path[0] == '/' || path[0] == '\\') {
-		return parsed, nil
-	}
-	if len(path) >= 2 && path[0] == '.' && (path[1] == '/' || path[1] == '\\') {
-		return parsed, nil
-	}
-	// Check for Windows drive paths - but only on Windows platforms
-	// On non-Windows, a single letter followed by : is a valid remote name
-	if driveletter.IsWindowsDrivePath(path) {
-		return parsed, nil
-	}
 	// States for parser
 	const (
 		stateConfigName = uint8(iota)
@@ -242,19 +153,17 @@ loop:
 				return parsed, nil
 			} else if c == ':' || c == ',' {
 				parsed.Name = path[:i]
-				// Check if this looks like a Windows drive letter.
-				// IsDriveLetter returns true only on Windows for single letters A-Z,
-				// so on non-Windows platforms single-letter remote names like "C:" work.
-				if c == ':' && len(parsed.Name) == 1 && driveletter.IsDriveLetter(parsed.Name) {
-					parsed.Name = ""
-					return parsed, nil
-				}
 				err := checkRemoteName(parsed.Name + ":")
 				if err != nil {
 					return parsed, err
 				}
 				prev = i + 1
 				if c == ':' {
+					// If we parsed a drive letter, must be a local path
+					if driveletter.IsDriveLetter(parsed.Name) {
+						parsed.Name = ""
+						return parsed, nil
+					}
 					state = stateDone
 					break loop
 				}

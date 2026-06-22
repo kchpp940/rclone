@@ -36,12 +36,6 @@ var (
 	// implementation from the fs
 	ConfigFileHasSection = func(section string) bool { return false }
 
-	// Get the list of section names from the config file
-	//
-	// This is a function pointer to decouple the config
-	// implementation from the fs
-	ConfigFileGetSectionNames = func() []string { return nil }
-
 	// CountError counts an error.  If any errors have been
 	// counted then rclone will exit with a non zero error code.
 	//

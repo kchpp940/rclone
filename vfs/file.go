@@ -286,6 +286,11 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
 			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
 				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
+				// Cache rename failure is non-fatal here; the cache
+				// layer already rolled back its own state so no
+				// ghost files are left behind. The remote rename
+				// already succeeded, so we proceed with updating
+				// the node.
 			}
 		}
 		// Update the node with the new details
@@ -301,14 +306,25 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 		return nil
 	}
 
-	// rename the file object
+	// Save original state so we can roll back if renameCall fails
 	dPath := destDir.Path()
 	f.mu.Lock()
+	origDir := f.d
+	origDPath := f.dPath
+	origLeaf := f.leaf
 	f.d = destDir
 	f.dPath = dPath
 	f.leaf = newName
 	writing := f._writingInProgress()
 	f.mu.Unlock()
+
+	rollbackNodeState := func() {
+		f.mu.Lock()
+		f.d = origDir
+		f.dPath = origDPath
+		f.leaf = origLeaf
+		f.mu.Unlock()
+	}
 
 	// Delay the rename if not using RW caching. For the minimal case we
 	// need to look in the cache to see if caching is in use.
@@ -320,10 +336,24 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 		f.mu.Lock()
 		f.pendingRenameFun = renameCall
 		f.mu.Unlock()
+		// Even though the remote/cache rename is deferred, we must
+		// move the virtual directory entry now so that directory
+		// listings don't show the stale old path for the dirty file.
+		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
+			if isDirty, sz := d.vfs.cache.StatDirty(oldPath); isDirty {
+				_ = d.vfs.DelVirtual(oldPath)
+				_ = d.vfs.AddVirtual(newPath, sz, false)
+			}
+		}
 		return nil
 	}
 
-	return renameCall(ctx)
+	err := renameCall(ctx)
+	if err != nil {
+		rollbackNodeState()
+		return err
+	}
+	return nil
 }
 
 // addWriter adds a write handle to the file

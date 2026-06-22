@@ -371,6 +371,7 @@ func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
 			cancel()
 			return
 		}
+		cache.SetDelVirtual(vfs.DelVirtual)
 		vfs.Opt.CacheMode = cacheMode
 		vfs.cancelCache = cancel
 		vfs.cache = cache
@@ -857,7 +858,32 @@ func (vfs *VFS) AddVirtual(remote string, size int64, isDir bool) (err error) {
 	if err != nil {
 		return err
 	}
-	dir.AddVirtual(leaf, size, false)
+	// Strip LinkSuffix for AddVirtual - it stores the raw leaf
+	addLeaf := leaf
+	if vfs.Opt.Links {
+		addLeaf, _ = strings.CutSuffix(leaf, fs.LinkSuffix)
+	}
+	dir.AddVirtual(addLeaf, size, isDir)
+	return nil
+}
+
+// DelVirtual removes an object from the directory cache by marking
+// it as virtually deleted.
+//
+// This is used by the vfs cache when renaming or removing dirty
+// items that were previously inserted via AddVirtual.
+func (vfs *VFS) DelVirtual(remote string) (err error) {
+	remote = strings.TrimRight(remote, "/")
+	dir, leaf, err := vfs.StatParent(remote)
+	if err != nil {
+		return err
+	}
+	// Strip LinkSuffix for DelVirtual - it stores the raw leaf
+	delLeaf := leaf
+	if vfs.Opt.Links {
+		delLeaf, _ = strings.CutSuffix(leaf, fs.LinkSuffix)
+	}
+	dir.DelVirtual(delLeaf)
 	return nil
 }
 
