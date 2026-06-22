@@ -168,10 +168,21 @@ func getKnownRemotes() map[string]bool {
 	return knownRemotes
 }
 
+// localPathExists checks if a path actually exists on the local filesystem.
+// Used by LocalFirst resolution mode to disambiguate "foo:bar" style paths.
+func localPathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // ResolvePath resolves a path string into a Parsed structure with full context.
 //
 // This is the unified entry point for path resolution that handles ambiguities
 // like "foo:bar" by checking if "foo" is a configured remote.
+//
+// CLI/RC entry points use RemoteFirst mode: unknown remote names are preserved
+// so that ParseRemote can report "remote not found" errors instead of silently
+// treating typos like "drivedata:/" as local paths.
 //
 // Rules (highest priority first):
 //  1. UNC paths (//server/share or \\server\share) → local path
@@ -179,10 +190,14 @@ func getKnownRemotes() map[string]bool {
 //  3. Windows drive paths (C:\, C:/, C:) → local path (Windows only)
 //  4. On-the-fly remote (:type:) → remote
 //  5. Name matches configured remote → remote:path
-//  6. Name doesn't match any configured remote → local path (handles "foo:bar" filenames)
+//  6. Name doesn't match any configured remote:
+//     - RemoteFirst (CLI/RC default): keep remote:path, ParseRemote reports error
+//     - LocalFirst: fall back to local path only if the path actually exists
 func ResolvePath(path string) (parsed fspath.Parsed, err error) {
 	opt := fspath.ResolveOptions{
-		KnownRemotes: getKnownRemotes(),
+		KnownRemotes:    getKnownRemotes(),
+		Mode:            fspath.RemoteFirst,
+		LocalPathExists: localPathExists,
 	}
 	return fspath.ResolveWithOptions(path, opt)
 }

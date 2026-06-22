@@ -12,15 +12,34 @@ import (
 	"github.com/rclone/rclone/fs/driveletter"
 )
 
+// ResolveMode controls how ambiguous paths like "foo:bar" are resolved when
+// the name doesn't match any known remote.
+type ResolveMode int
+
+const (
+	// RemoteFirst preserves remote:path resolution for unknown names.
+	// Used by CLI and RC entry points so that typos like "drivedata:/"
+	// produce a clear "remote not found" error instead of silently
+	// falling back to a local file named "drivedata:/".
+	RemoteFirst ResolveMode = iota
+
+	// LocalFirst falls back to local path resolution for unknown names
+	// when a LocalPathExists check confirms the path exists, or when
+	// explicitly requested by the caller.
+	LocalFirst
+)
+
 // ResolveOptions provides context for resolving ambiguous paths like "foo:bar"
 type ResolveOptions struct {
-	KnownRemotes map[string]bool // Set of known remote names
+	KnownRemotes    map[string]bool        // Set of known remote names
+	Mode            ResolveMode            // How to resolve unknown names
+	LocalPathExists func(path string) bool // Optional: check if a local path actually exists
 }
 
 // ResolveWithOptions parses path with additional context to resolve ambiguities.
 //
 // This is the preferred entry point for parsing paths, as it can distinguish
-// between "foo:bar" as a remote:path or a local filename based on KnownRemotes.
+// between "foo:bar" as a remote:path or a local filename based on context.
 //
 // Rules (highest priority first):
 //  1. UNC paths (//server/share or \\server\share) → local path
@@ -28,7 +47,10 @@ type ResolveOptions struct {
 //  3. Windows drive paths (C:\, C:/, C:) → local path (Windows only)
 //  4. On-the-fly remote (:type:) → remote
 //  5. Name matches KnownRemotes → remote:path
-//  6. Name doesn't match KnownRemotes → local path (handles "foo:bar" filenames)
+//  6. Name doesn't match KnownRemotes:
+//     - RemoteFirst mode (CLI/RC default): keep remote:path, let caller report error
+//     - LocalFirst mode: if LocalPathExists is provided and returns true → local path;
+//     otherwise keep remote:path, let caller report error
 func ResolveWithOptions(path string, opt ResolveOptions) (parsed Parsed, err error) {
 	parsed, err = Parse(path)
 	if err != nil {
@@ -47,10 +69,16 @@ func ResolveWithOptions(path string, opt ResolveOptions) (parsed Parsed, err err
 		return parsed, nil
 	}
 
-	parsed.Name = ""
-	parsed.ConfigString = ""
-	parsed.Config = nil
-	parsed.Path = filepath.ToSlash(path)
+	if opt.Mode == LocalFirst {
+		if opt.LocalPathExists != nil && opt.LocalPathExists(path) {
+			parsed.Name = ""
+			parsed.ConfigString = ""
+			parsed.Config = nil
+			parsed.Path = filepath.ToSlash(path)
+			return parsed, nil
+		}
+	}
+
 	return parsed, nil
 }
 

@@ -7,7 +7,6 @@ import (
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fstest/mockfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -87,9 +86,9 @@ func TestResolvePath(t *testing.T) {
 			wantConfig: "foo",
 		}, {
 			in:         "unknown:path",
-			wantName:   "",
-			wantPath:   "unknown:path",
-			wantConfig: "",
+			wantName:   "unknown",
+			wantPath:   "path",
+			wantConfig: "unknown",
 		}, {
 			in:         "./foo:bar",
 			wantName:   "",
@@ -197,11 +196,18 @@ func TestResolvePathWithCaches(t *testing.T) {
 		return configuredRemotes[section]
 	}
 
-	t.Run("ambiguous_local_file_vs_remote", func(t *testing.T) {
+	t.Run("known_remote", func(t *testing.T) {
 		parsed, err := fs.ResolvePath("foo:bar")
 		require.NoError(t, err)
 		assert.Equal(t, "foo", parsed.Name)
 		assert.Equal(t, "bar", parsed.Path)
+	})
+
+	t.Run("unknown_remote_preserved_RemoteFirst", func(t *testing.T) {
+		parsed, err := fs.ResolvePath("typo:data")
+		require.NoError(t, err)
+		assert.Equal(t, "typo", parsed.Name, "RemoteFirst should preserve unknown remote name for ParseRemote to error on")
+		assert.Equal(t, "data", parsed.Path)
 	})
 
 	t.Run("explicit_local_path_with_colon", func(t *testing.T) {
@@ -246,12 +252,15 @@ func TestParseRemoteWithResolvePath(t *testing.T) {
 	mockfs.Register()
 
 	fs.ConfigFileGetSectionNames = func() []string {
-		return []string{"testremote"}
+		return []string{"testremote", "alias", "crypt", "chunker"}
 	}
 
 	fs.ConfigFileGet = func(section, key string) (string, bool) {
-		if section == "testremote" && key == "type" {
-			return "mockfs", true
+		switch section {
+		case "testremote", "alias", "crypt", "chunker":
+			if key == "type" {
+				return "mockfs", true
+			}
 		}
 		return "", false
 	}
@@ -264,12 +273,16 @@ func TestParseRemoteWithResolvePath(t *testing.T) {
 		assert.Equal(t, "mockfs", fsInfo.Name)
 	})
 
-	t.Run("unknown_remote_falls_back_to_local", func(t *testing.T) {
-		fsInfo, configName, fsPath, _, err := fs.ParseRemote("unknown:path")
-		require.NoError(t, err)
-		assert.Equal(t, "local", configName)
-		assert.Equal(t, "unknown:path", fsPath)
-		assert.Equal(t, "local", fsInfo.Name)
+	t.Run("unknown_remote_returns_error", func(t *testing.T) {
+		_, _, _, _, err := fs.ParseRemote("unknown:path")
+		require.Error(t, err, "unknown remote should return NotFoundInConfigFile error, not fall back to local")
+		assert.ErrorIs(t, err, fs.ErrorNotFoundInConfigFile)
+	})
+
+	t.Run("typo_remote_returns_error", func(t *testing.T) {
+		_, _, _, _, err := fs.ParseRemote("testremot:data")
+		require.Error(t, err, "typo'd remote name should return error")
+		assert.ErrorIs(t, err, fs.ErrorNotFoundInConfigFile)
 	})
 
 	t.Run("explicit_local_path_with_colon", func(t *testing.T) {
@@ -280,11 +293,112 @@ func TestParseRemoteWithResolvePath(t *testing.T) {
 		assert.Equal(t, "local", fsInfo.Name)
 	})
 
-	t.Run("wrapper_backend_path", func(t *testing.T) {
-		parsed, err := fspath.Parse("alias:crypt:path")
+	t.Run("absolute_local_path_with_colon", func(t *testing.T) {
+		fsInfo, configName, fsPath, _, err := fs.ParseRemote("/path/to/foo:bar")
 		require.NoError(t, err)
-		assert.Equal(t, "alias", parsed.Name)
-		assert.Equal(t, "crypt:path", parsed.Path)
+		assert.Equal(t, "local", configName)
+		assert.Equal(t, "/path/to/foo:bar", fsPath)
+		assert.Equal(t, "local", fsInfo.Name)
+	})
+
+	t.Run("UNC_path", func(t *testing.T) {
+		fsInfo, configName, fsPath, _, err := fs.ParseRemote("//server/share/path")
+		require.NoError(t, err)
+		assert.Equal(t, "local", configName)
+		assert.Equal(t, "//server/share/path", fsPath)
+		assert.Equal(t, "local", fsInfo.Name)
+	})
+
+	t.Run("wrapper_backend_known_outer", func(t *testing.T) {
+		fsInfo, configName, fsPath, _, err := fs.ParseRemote("alias:crypt:path")
+		require.NoError(t, err)
+		assert.Equal(t, "alias", configName)
+		assert.Equal(t, "crypt:path", fsPath)
+		assert.Equal(t, "mockfs", fsInfo.Name)
+	})
+
+	t.Run("wrapper_backend_unknown_outer_returns_error", func(t *testing.T) {
+		_, _, _, _, err := fs.ParseRemote("unknownalias:crypt:path")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, fs.ErrorNotFoundInConfigFile)
+	})
+
+	t.Run("on_the_fly_remote", func(t *testing.T) {
+		fsInfo, configName, fsPath, _, err := fs.ParseRemote(":mockfs:/tmp/test")
+		require.NoError(t, err)
+		assert.Equal(t, ":mockfs", configName)
+		assert.Equal(t, "/tmp/test", fsPath)
+		assert.Equal(t, "mockfs", fsInfo.Name)
+	})
+
+	t.Run("plain_relative_local_path", func(t *testing.T) {
+		fsInfo, configName, fsPath, _, err := fs.ParseRemote("relative/path")
+		require.NoError(t, err)
+		assert.Equal(t, "local", configName)
+		assert.Equal(t, "relative/path", fsPath)
+		assert.Equal(t, "local", fsInfo.Name)
+	})
+}
+
+func TestNewFsEntryPointPathResolution(t *testing.T) {
+	ctx := context.Background()
+	oldGetSectionNames := fs.ConfigFileGetSectionNames
+	oldGet := fs.ConfigFileGet
+	oldRegistry := fs.Registry
+	defer func() {
+		fs.ConfigFileGetSectionNames = oldGetSectionNames
+		fs.ConfigFileGet = oldGet
+		fs.Registry = oldRegistry
+	}()
+
+	mockfs.Register()
+
+	fs.ConfigFileGetSectionNames = func() []string {
+		return []string{"myremote", "alias", "crypt"}
+	}
+
+	fs.ConfigFileGet = func(section, key string) (string, bool) {
+		switch section {
+		case "myremote", "alias", "crypt":
+			if key == "type" {
+				return "mockfs", true
+			}
+		}
+		return "", false
+	}
+
+	t.Run("known_remote_via_NewFs", func(t *testing.T) {
+		f, err := fs.NewFs(ctx, "myremote:path/to/data")
+		require.NoError(t, err)
+		assert.Equal(t, "myremote", f.Name())
+		assert.Equal(t, "path/to/data", f.Root())
+	})
+
+	t.Run("unknown_remote_via_NewFs_returns_error", func(t *testing.T) {
+		_, err := fs.NewFs(ctx, "typo:path/to/data")
+		require.Error(t, err, "unknown remote via NewFs should return error, not fall back to local")
+		assert.ErrorIs(t, err, fs.ErrorNotFoundInConfigFile)
+	})
+
+	t.Run("explicit_local_with_colon_via_NewFs", func(t *testing.T) {
+		f, err := fs.NewFs(ctx, "./foo:bar")
+		require.NoError(t, err)
+		assert.Equal(t, "local", f.Name())
+		assert.Contains(t, f.Root(), "foo:bar", "local backend Root should contain the original foo:bar suffix (may be absolutized)")
+	})
+
+	t.Run("wrapper_backend_via_NewFs", func(t *testing.T) {
+		f, err := fs.NewFs(ctx, "alias:crypt:somepath")
+		require.NoError(t, err)
+		assert.Equal(t, "alias", f.Name())
+		assert.Equal(t, "crypt:somepath", f.Root())
+	})
+
+	t.Run("on_the_fly_remote_via_NewFs", func(t *testing.T) {
+		f, err := fs.NewFs(ctx, ":mockfs:/tmp/test")
+		require.NoError(t, err)
+		assert.Equal(t, ":mockfs", f.Name())
+		assert.Equal(t, "/tmp/test", f.Root())
 	})
 }
 
@@ -293,7 +407,7 @@ func TestResolvePathRoundTrip(t *testing.T) {
 	defer func() { fs.ConfigFileGetSectionNames = oldGetSectionNames }()
 
 	fs.ConfigFileGetSectionNames = func() []string {
-		return []string{"foo", "alias", "crypt", "chunker"}
+		return []string{"foo", "alias", "crypt", "chunker", "C"}
 	}
 
 	testCases := []string{

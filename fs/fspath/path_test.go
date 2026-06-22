@@ -693,138 +693,210 @@ func TestMakeAbsolute(t *testing.T) {
 }
 
 func TestResolveWithOptions(t *testing.T) {
-	for _, test := range []struct {
-		in           string
-		knownRemotes map[string]bool
-		wantParsed   Parsed
-		wantErr      error
-		win          bool
-		noWin        bool
-	}{
-		{
-			in:           "foo:bar",
-			knownRemotes: map[string]bool{"foo": true},
-			wantParsed: Parsed{
-				Name:         "foo",
-				ConfigString: "foo",
-				Path:         "bar",
-			},
-		}, {
-			in:           "foo:bar",
-			knownRemotes: map[string]bool{},
-			wantParsed: Parsed{
-				Name: "",
-				Path: "foo:bar",
-			},
-		}, {
-			in:           "foo:bar",
-			knownRemotes: nil,
-			wantParsed: Parsed{
-				Name: "",
-				Path: "foo:bar",
-			},
-		}, {
-			in:           "./foo:bar",
-			knownRemotes: map[string]bool{"foo": true},
-			wantParsed: Parsed{
-				Name: "",
-				Path: "./foo:bar",
-			},
-		}, {
-			in:           "/foo:bar",
-			knownRemotes: map[string]bool{"foo": true},
-			wantParsed: Parsed{
-				Name: "",
-				Path: "/foo:bar",
-			},
-		}, {
-			in:           "C:",
-			knownRemotes: map[string]bool{"C": true},
-			wantParsed: Parsed{
-				Name:         "C",
-				ConfigString: "C",
-				Path:         "",
-			},
-			noWin: true,
-		}, {
-			in:           "C:",
-			knownRemotes: map[string]bool{"C": true},
-			wantParsed: Parsed{
-				Name: "",
-				Path: "C:",
-			},
-			win: true,
-		}, {
-			in:           "C:file.txt",
-			knownRemotes: map[string]bool{"C": true},
-			wantParsed: Parsed{
-				Name:         "C",
-				ConfigString: "C",
-				Path:         "file.txt",
-			},
-			noWin: true,
-		}, {
-			in:           "C:file.txt",
-			knownRemotes: map[string]bool{"C": true},
-			wantParsed: Parsed{
-				Name: "",
-				Path: "C:file.txt",
-			},
-			win: true,
-		}, {
-			in:           "//server/share/path",
-			knownRemotes: map[string]bool{"server": true},
-			wantParsed: Parsed{
-				Name: "",
-				Path: "//server/share/path",
-			},
-		}, {
-			in:           ":s3,key=xxx:",
-			knownRemotes: map[string]bool{},
-			wantParsed: Parsed{
-				Name:         ":s3",
-				ConfigString: ":s3,key=xxx",
-				Path:         "",
-				Config:       configmap.Simple{"key": "xxx"},
-			},
-		}, {
-			in:           "alias:crypt:path",
-			knownRemotes: map[string]bool{"alias": true},
-			wantParsed: Parsed{
-				Name:         "alias",
-				ConfigString: "alias",
-				Path:         "crypt:path",
-			},
-		}, {
-			in:           "alias:crypt:path",
-			knownRemotes: map[string]bool{},
-			wantParsed: Parsed{
-				Name: "",
-				Path: "alias:crypt:path",
-			},
-		}, {
-			in:           "crypt:chunker:data",
-			knownRemotes: map[string]bool{"crypt": true},
-			wantParsed: Parsed{
-				Name:         "crypt",
-				ConfigString: "crypt",
-				Path:         "chunker:data",
-			},
-		},
-	} {
-		if runtime.GOOS == "windows" && test.noWin {
-			continue
+	t.Run("RemoteFirst_mode_known_remote", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{"foo": true},
+			Mode:         RemoteFirst,
 		}
-		if runtime.GOOS != "windows" && test.win {
-			continue
+		parsed, err := ResolveWithOptions("foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "foo", parsed.Name)
+		assert.Equal(t, "bar", parsed.Path)
+	})
+
+	t.Run("RemoteFirst_mode_unknown_remote_preserves_remote_syntax", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{},
+			Mode:         RemoteFirst,
 		}
-		opt := ResolveOptions{KnownRemotes: test.knownRemotes}
-		gotParsed, gotErr := ResolveWithOptions(test.in, opt)
-		assert.Equal(t, test.wantErr, gotErr, test.in)
-		if test.wantErr == nil {
-			assert.Equal(t, test.wantParsed, gotParsed, test.in)
+		parsed, err := ResolveWithOptions("foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "foo", parsed.Name, "RemoteFirst should preserve remote name for unknown remotes")
+		assert.Equal(t, "bar", parsed.Path)
+	})
+
+	t.Run("RemoteFirst_mode_unknown_remote_nil_KnownRemotes", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: nil,
+			Mode:         RemoteFirst,
 		}
-	}
+		parsed, err := ResolveWithOptions("typo:data", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "typo", parsed.Name)
+		assert.Equal(t, "data", parsed.Path)
+	})
+
+	t.Run("RemoteFirst_mode_explicit_local_prefix_always_local", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{"foo": true},
+			Mode:         RemoteFirst,
+		}
+		parsed, err := ResolveWithOptions("./foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "", parsed.Name)
+		assert.Equal(t, "./foo:bar", parsed.Path)
+
+		parsed, err = ResolveWithOptions("/foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "", parsed.Name)
+		assert.Equal(t, "/foo:bar", parsed.Path)
+	})
+
+	t.Run("LocalFirst_mode_known_remote", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{"foo": true},
+			Mode:         LocalFirst,
+			LocalPathExists: func(string) bool {
+				return true
+			},
+		}
+		parsed, err := ResolveWithOptions("foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "foo", parsed.Name)
+		assert.Equal(t, "bar", parsed.Path)
+	})
+
+	t.Run("LocalFirst_mode_unknown_remote_path_exists", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{},
+			Mode:         LocalFirst,
+			LocalPathExists: func(p string) bool {
+				return p == "foo:bar"
+			},
+		}
+		parsed, err := ResolveWithOptions("foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "", parsed.Name, "LocalFirst with existing path should fall back to local")
+		assert.Equal(t, "foo:bar", parsed.Path)
+	})
+
+	t.Run("LocalFirst_mode_unknown_remote_path_not_exists", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{},
+			Mode:         LocalFirst,
+			LocalPathExists: func(string) bool {
+				return false
+			},
+		}
+		parsed, err := ResolveWithOptions("foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "foo", parsed.Name, "LocalFirst with non-existing path should preserve remote")
+		assert.Equal(t, "bar", parsed.Path)
+	})
+
+	t.Run("LocalFirst_mode_unknown_remote_no_LocalPathExists", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes:    map[string]bool{},
+			Mode:            LocalFirst,
+			LocalPathExists: nil,
+		}
+		parsed, err := ResolveWithOptions("foo:bar", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "foo", parsed.Name, "LocalFirst without LocalPathExists should preserve remote")
+		assert.Equal(t, "bar", parsed.Path)
+	})
+
+	t.Run("UNC_path_always_local", func(t *testing.T) {
+		for _, mode := range []ResolveMode{RemoteFirst, LocalFirst} {
+			opt := ResolveOptions{
+				KnownRemotes: map[string]bool{"server": true},
+				Mode:         mode,
+			}
+			parsed, err := ResolveWithOptions("//server/share/path", opt)
+			require.NoError(t, err, "mode=%v", mode)
+			assert.Equal(t, "", parsed.Name, "mode=%v", mode)
+			assert.Equal(t, "//server/share/path", parsed.Path, "mode=%v", mode)
+		}
+	})
+
+	t.Run("On_the_fly_remote_always_remote", func(t *testing.T) {
+		for _, mode := range []ResolveMode{RemoteFirst, LocalFirst} {
+			opt := ResolveOptions{
+				KnownRemotes: map[string]bool{},
+				Mode:         mode,
+			}
+			parsed, err := ResolveWithOptions(":s3,key=xxx:", opt)
+			require.NoError(t, err, "mode=%v", mode)
+			assert.Equal(t, ":s3", parsed.Name, "mode=%v", mode)
+			assert.Equal(t, "", parsed.Path, "mode=%v", mode)
+			assert.Equal(t, ":s3,key=xxx", parsed.ConfigString, "mode=%v", mode)
+		}
+	})
+
+	t.Run("Single_letter_C_remote_non_Windows", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Skipping on Windows")
+		}
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{"C": true},
+			Mode:         RemoteFirst,
+		}
+		parsed, err := ResolveWithOptions("C:", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "C", parsed.Name)
+		assert.Equal(t, "", parsed.Path)
+
+		parsed, err = ResolveWithOptions("C:file.txt", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "C", parsed.Name)
+		assert.Equal(t, "file.txt", parsed.Path)
+	})
+
+	t.Run("Single_letter_C_drive_Windows", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			t.Skip("Skipping on non-Windows")
+		}
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{"C": true},
+			Mode:         RemoteFirst,
+		}
+		parsed, err := ResolveWithOptions("C:", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "", parsed.Name)
+		assert.Equal(t, "C:", parsed.Path)
+
+		parsed, err = ResolveWithOptions("C:file.txt", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "", parsed.Name)
+		assert.Equal(t, "C:file.txt", parsed.Path)
+	})
+
+	t.Run("Wrapper_backend_nested_paths", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{"alias": true, "crypt": true},
+			Mode:         RemoteFirst,
+		}
+		parsed, err := ResolveWithOptions("alias:crypt:path", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "alias", parsed.Name)
+		assert.Equal(t, "crypt:path", parsed.Path)
+
+		parsed, err = ResolveWithOptions("crypt:chunker:data", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "crypt", parsed.Name)
+		assert.Equal(t, "chunker:data", parsed.Path)
+	})
+
+	t.Run("Wrapper_backend_unknown_outer_remote_RemoteFirst", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{},
+			Mode:         RemoteFirst,
+		}
+		parsed, err := ResolveWithOptions("alias:crypt:path", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "alias", parsed.Name, "RemoteFirst should preserve unknown outer remote name")
+		assert.Equal(t, "crypt:path", parsed.Path)
+	})
+
+	t.Run("Default_mode_is_RemoteFirst", func(t *testing.T) {
+		opt := ResolveOptions{
+			KnownRemotes: map[string]bool{},
+		}
+		parsed, err := ResolveWithOptions("typo:data", opt)
+		require.NoError(t, err)
+		assert.Equal(t, "typo", parsed.Name)
+		assert.Equal(t, "data", parsed.Path)
+	})
 }
 
 func TestJoinRootPath(t *testing.T) {
