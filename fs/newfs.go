@@ -159,10 +159,38 @@ func ConfigFs(path string) (fsInfo *RegInfo, configName, fsPath string, config *
 	return
 }
 
+// getKnownRemotes returns the set of known remote names from config
+func getKnownRemotes() map[string]bool {
+	knownRemotes := make(map[string]bool)
+	for _, section := range ConfigFileGetSectionNames() {
+		knownRemotes[section] = true
+	}
+	return knownRemotes
+}
+
+// ResolvePath resolves a path string into a Parsed structure with full context.
+//
+// This is the unified entry point for path resolution that handles ambiguities
+// like "foo:bar" by checking if "foo" is a configured remote.
+//
+// Rules (highest priority first):
+//  1. UNC paths (//server/share or \\server\share) → local path
+//  2. Explicit local prefix (/ or ./ or .\) → local path
+//  3. Windows drive paths (C:\, C:/, C:) → local path (Windows only)
+//  4. On-the-fly remote (:type:) → remote
+//  5. Name matches configured remote → remote:path
+//  6. Name doesn't match any configured remote → local path (handles "foo:bar" filenames)
+func ResolvePath(path string) (parsed fspath.Parsed, err error) {
+	opt := fspath.ResolveOptions{
+		KnownRemotes: getKnownRemotes(),
+	}
+	return fspath.ResolveWithOptions(path, opt)
+}
+
 // ParseRemote deconstructs a path into configName, fsPath, looking up
 // the fsName in the config file (returning NotFoundInConfigFile if not found)
 func ParseRemote(path string) (fsInfo *RegInfo, configName, fsPath string, connectionStringConfig configmap.Simple, err error) {
-	parsed, err := fspath.Parse(path)
+	parsed, err := ResolvePath(path)
 	if err != nil {
 		return nil, "", "", nil, err
 	}

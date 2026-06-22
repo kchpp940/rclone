@@ -692,6 +692,141 @@ func TestMakeAbsolute(t *testing.T) {
 	}
 }
 
+func TestResolveWithOptions(t *testing.T) {
+	for _, test := range []struct {
+		in           string
+		knownRemotes map[string]bool
+		wantParsed   Parsed
+		wantErr      error
+		win          bool
+		noWin        bool
+	}{
+		{
+			in:           "foo:bar",
+			knownRemotes: map[string]bool{"foo": true},
+			wantParsed: Parsed{
+				Name:         "foo",
+				ConfigString: "foo",
+				Path:         "bar",
+			},
+		}, {
+			in:           "foo:bar",
+			knownRemotes: map[string]bool{},
+			wantParsed: Parsed{
+				Name: "",
+				Path: "foo:bar",
+			},
+		}, {
+			in:           "foo:bar",
+			knownRemotes: nil,
+			wantParsed: Parsed{
+				Name: "",
+				Path: "foo:bar",
+			},
+		}, {
+			in:           "./foo:bar",
+			knownRemotes: map[string]bool{"foo": true},
+			wantParsed: Parsed{
+				Name: "",
+				Path: "./foo:bar",
+			},
+		}, {
+			in:           "/foo:bar",
+			knownRemotes: map[string]bool{"foo": true},
+			wantParsed: Parsed{
+				Name: "",
+				Path: "/foo:bar",
+			},
+		}, {
+			in:           "C:",
+			knownRemotes: map[string]bool{"C": true},
+			wantParsed: Parsed{
+				Name:         "C",
+				ConfigString: "C",
+				Path:         "",
+			},
+			noWin: true,
+		}, {
+			in:           "C:",
+			knownRemotes: map[string]bool{"C": true},
+			wantParsed: Parsed{
+				Name: "",
+				Path: "C:",
+			},
+			win: true,
+		}, {
+			in:           "C:file.txt",
+			knownRemotes: map[string]bool{"C": true},
+			wantParsed: Parsed{
+				Name:         "C",
+				ConfigString: "C",
+				Path:         "file.txt",
+			},
+			noWin: true,
+		}, {
+			in:           "C:file.txt",
+			knownRemotes: map[string]bool{"C": true},
+			wantParsed: Parsed{
+				Name: "",
+				Path: "C:file.txt",
+			},
+			win: true,
+		}, {
+			in:           "//server/share/path",
+			knownRemotes: map[string]bool{"server": true},
+			wantParsed: Parsed{
+				Name: "",
+				Path: "//server/share/path",
+			},
+		}, {
+			in:           ":s3,key=xxx:",
+			knownRemotes: map[string]bool{},
+			wantParsed: Parsed{
+				Name:         ":s3",
+				ConfigString: ":s3,key=xxx",
+				Path:         "",
+				Config:       configmap.Simple{"key": "xxx"},
+			},
+		}, {
+			in:           "alias:crypt:path",
+			knownRemotes: map[string]bool{"alias": true},
+			wantParsed: Parsed{
+				Name:         "alias",
+				ConfigString: "alias",
+				Path:         "crypt:path",
+			},
+		}, {
+			in:           "alias:crypt:path",
+			knownRemotes: map[string]bool{},
+			wantParsed: Parsed{
+				Name: "",
+				Path: "alias:crypt:path",
+			},
+		}, {
+			in:           "crypt:chunker:data",
+			knownRemotes: map[string]bool{"crypt": true},
+			wantParsed: Parsed{
+				Name:         "crypt",
+				ConfigString: "crypt",
+				Path:         "chunker:data",
+			},
+		},
+	} {
+		if runtime.GOOS == "windows" && test.noWin {
+			continue
+		}
+		if runtime.GOOS != "windows" && test.win {
+			continue
+		}
+		opt := ResolveOptions{KnownRemotes: test.knownRemotes}
+		gotParsed, gotErr := ResolveWithOptions(test.in, opt)
+		assert.Equal(t, test.wantErr, gotErr, test.in)
+		if test.wantErr == nil {
+			assert.Equal(t, test.wantParsed, gotParsed, test.in)
+		}
+	}
+}
+
 func TestJoinRootPath(t *testing.T) {
 	for _, test := range []struct {
 		remote   string

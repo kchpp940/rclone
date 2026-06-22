@@ -128,6 +128,9 @@ func init() {
 	fs.ConfigFileHasSection = func(section string) bool {
 		return LoadedData().HasSection(section)
 	}
+	fs.ConfigFileGetSectionNames = func() []string {
+		return LoadedData().GetSectionList()
+	}
 	configPath = makeConfigPath()
 	cacheDir = makeCacheDir() // Has fallback to tempDir, so set that first
 	data = newDefaultStorage()

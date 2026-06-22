@@ -12,6 +12,48 @@ import (
 	"github.com/rclone/rclone/fs/driveletter"
 )
 
+// ResolveOptions provides context for resolving ambiguous paths like "foo:bar"
+type ResolveOptions struct {
+	KnownRemotes map[string]bool // Set of known remote names
+}
+
+// ResolveWithOptions parses path with additional context to resolve ambiguities.
+//
+// This is the preferred entry point for parsing paths, as it can distinguish
+// between "foo:bar" as a remote:path or a local filename based on KnownRemotes.
+//
+// Rules (highest priority first):
+//  1. UNC paths (//server/share or \\server\share) → local path
+//  2. Explicit local prefix (/ or ./ or .\) → local path
+//  3. Windows drive paths (C:\, C:/, C:) → local path (Windows only)
+//  4. On-the-fly remote (:type:) → remote
+//  5. Name matches KnownRemotes → remote:path
+//  6. Name doesn't match KnownRemotes → local path (handles "foo:bar" filenames)
+func ResolveWithOptions(path string, opt ResolveOptions) (parsed Parsed, err error) {
+	parsed, err = Parse(path)
+	if err != nil {
+		return parsed, err
+	}
+
+	if parsed.Name == "" {
+		return parsed, nil
+	}
+
+	if strings.HasPrefix(parsed.Name, ":") {
+		return parsed, nil
+	}
+
+	if opt.KnownRemotes != nil && opt.KnownRemotes[parsed.Name] {
+		return parsed, nil
+	}
+
+	parsed.Name = ""
+	parsed.ConfigString = ""
+	parsed.Config = nil
+	parsed.Path = filepath.ToSlash(path)
+	return parsed, nil
+}
+
 const (
 	configNameRe              = `[\w\p{L}\p{N}.+@]+(?:[ -]+[\w\p{L}\p{N}.+@-]+)*` // May contain Unicode numbers and letters, as well as `_` (covered by \w), `-`, `.`, `+`, `@` and space, but not start with `-` (it complicates usage, see #4261) or space, and not end with space
 	illegalPartOfConfigNameRe = `^[ -]+|[^\w\p{L}\p{N}.+@ -]+|[ ]+$`
