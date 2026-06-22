@@ -169,9 +169,10 @@ func Bisync(ctx context.Context, fs1, fs2 fs.Fs, optArg *Options) (err error) {
 					}
 					markFailed(b.listing1)
 					markFailed(b.listing2)
-					// Do NOT clean up .lst-new/.lst-old/.que files here: they are
-					// preserved for diagnosis and for potential recovery, and will
-					// be removed by the next run's setLockFile() / resync cleanup.
+					// Do NOT archive or delete .lst-new/.lst-old/.que files here:
+					// they are preserved for diagnosis and will be archived to
+					// timestamped recovery files by the next run's setLockFile()
+					// or --resync invocation before any new state is written.
 				}
 				err = b.removeLockFile()
 			}
@@ -203,17 +204,21 @@ func Bisync(ctx context.Context, fs1, fs2 fs.Fs, optArg *Options) (err error) {
 		if b.retryable && b.opt.Resilient && !b.opt.Resync {
 			fs.Errorf(nil, Color(terminal.RedFg, "Bisync critical error: %v"), err)
 			fs.Error(nil, Color(terminal.YellowFg, "Bisync aborted. Error is retryable without --resync due to --resilient mode."))
-			// Resilient mode: leave stale files for next run to clean up in
+			// Resilient mode: leave stale files for next run to archive in
 			// setLockFile(), preserving diagnostic artifacts rather than
 			// wiping them eagerly.
 		} else {
-			// Use markFailed instead of raw Rename so we also purge
-			// .lst-new, -dry, -old, and .que files that could confuse the next run
+			// Use markFailed to rename the current .lst to .lst-err so the
+			// next run knows the previous run failed. Stale .lst-new,
+			// .lst-old, .que, and other temp files are left as-is for
+			// diagnosis; the next run will archive them to timestamped
+			// recovery files via setLockFile() or --resync before writing
+			// any new state.
 			markFailed(b.listing1)
 			markFailed(b.listing2)
-			// Do NOT call cleanupStaleFiles() here: stale listings, queues,
+			// Do NOT call archiveStaleFiles() here: stale listings, queues,
 			// and partials are left as-is for diagnosis. The next successful
-			// run acquires the lock and setLockFile() / resync will sweep.
+			// run acquires the lock and setLockFile() / resync will archive.
 			fs.Errorf(nil, Color(terminal.RedFg, "Bisync critical error: %v"), err)
 			fs.Error(nil, Color(terminal.RedFg, "Bisync aborted. Must run --resync to recover."))
 		}

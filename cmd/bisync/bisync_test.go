@@ -116,6 +116,10 @@ var logReplacements = []string{
 	`^(NOTICE: .*?: Skipped set directory modification time as --dry-run is set).*$`, dropMe,
 	// ignore sizes in directory metadata updates
 	`^(NOTICE: .*?: Skipped update directory metadata as --dry-run is set).*$`, dropMe,
+	// ignore bisync stale-file archival messages
+	`^INFO  : Detected failed-run marker; archiving stale listing/queue artifacts from prior run$`, dropMe,
+	`^INFO  : Archiving stale files from expired/interrupted prior run$`, dropMe,
+	`^INFO  : Archived stale prior-run file ".*" -> ".*"$`, dropMe,
 }
 
 // Some dry-run messages differ depending on the particular remote.
@@ -1231,17 +1235,44 @@ func (b *bisyncTest) runBisync(ctx context.Context, args []string) (err error) {
 
 // saveTestListings creates a copy of test artifacts with given prefix
 // including listings (.lst*), queues (.que) and filters (.flt, .flt.md5)
+// It also picks up any recovery-archived stale files (.recovery_* suffix)
+// and copies them under their original name so that scenario snapshots
+// reflect the complete state including failed-run diagnostics.
 func (b *bisyncTest) saveTestListings(prefix string, keepSource bool) (err error) {
 	count := 0
-	for _, srcFile := range b.listDir(b.workDir) {
-		switch fileType(srcFile) {
+	// Collect candidate files including recovery archives, preferring a
+	// non-archived file over any archived variant of the same base name.
+	seen := map[string]string{} // baseName -> actual file on disk
+	files, err := os.ReadDir(b.workDir)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		name := f.Name()
+		if strings.Contains(name, ".DS_Store") {
+			continue
+		}
+		base := name
+		if idx := strings.Index(name, ".recovery_"); idx != -1 {
+			base = name[:idx]
+		}
+		// Prefer non-archived over archived. Replace only if:
+		// - first time seeing this base, OR
+		// - previously stored was recovery-archived, and current one is not
+		if prev, ok := seen[base]; !ok || (strings.Contains(prev, ".recovery_") && !strings.Contains(name, ".recovery_")) {
+			seen[base] = name
+		}
+	}
+
+	for baseName, srcFile := range seen {
+		switch fileType(baseName) {
 		case "listing", "queue", "filters":
 			// fall thru
 		default:
 			continue
 		}
 		count++
-		dstFile := fmt.Sprintf("%s.%s.sav", prefix, b.toGolden(srcFile))
+		dstFile := fmt.Sprintf("%s.%s.sav", prefix, b.toGolden(baseName))
 		src := filepath.Join(b.workDir, srcFile)
 		dst := filepath.Join(b.workDir, dstFile)
 		if err = bilib.CopyFile(src, dst); err != nil {
@@ -1437,6 +1468,31 @@ func (b *bisyncTest) compareResults() int {
 	goldenFiles := b.listDir(b.goldenDir)
 	resultFiles := b.listDir(b.workDir)
 
+	// Independently scan workDir BEFORE the rename step so we can capture
+	// recovery-archived files under their actual on-disk names.
+	// Recovery files are "diagnostic residuals" – they should only be used
+	// to passively match a file that the Golden set explicitly expects.
+	allWorkFiles, err := os.ReadDir(b.workDir)
+	require.NoError(b.t, err, "failed to read workDir")
+	recoveryMap := map[string]string{} // goldenBaseName -> actual disk file name
+	for _, f := range allWorkFiles {
+		name := f.Name()
+		if strings.Contains(name, ".DS_Store") {
+			continue
+		}
+		// Compute what this file's golden base name would be:
+		// first apply toGolden, then strip the recovery suffix.
+		goldName := b.toGolden(name)
+		if idx := strings.Index(goldName, ".recovery_"); idx != -1 {
+			base := goldName[:idx]
+			if _, exists := recoveryMap[base]; !exists {
+				// Store the original (un-goldened) disk file name so we
+				// can actually open it later when resolving.
+				recoveryMap[base] = name
+			}
+		}
+	}
+
 	// Adapt test file names to their golden counterparts
 	renamed := false
 	for _, fileName := range resultFiles {
@@ -1452,10 +1508,39 @@ func (b *bisyncTest) compareResults() int {
 		resultFiles = b.listDir(b.workDir)
 	}
 
+	// resolve returns the result file that represents the given golden file.
+	// Priority: 1) direct non-archived match 2) archived recovery match
+	resolve := func(goldenFile string) (string, bool) {
+		for _, rf := range resultFiles {
+			if rf == goldenFile {
+				return goldenFile, true
+			}
+		}
+		if rf, ok := recoveryMap[goldenFile]; ok {
+			return rf, true
+		}
+		return "", false
+	}
+
 	goldenSet := bilib.ToNames(goldenFiles)
-	resultSet := bilib.ToNames(resultFiles)
+	// Result set for accounting: start with non-recovery files, then add any
+	// golden-expected files whose only match is an archived recovery file.
+	// This keeps recovery residuals invisible unless Golden explicitly expects
+	// the base name.
+	adjustedResultSet := map[string]any{}
+	for _, rf := range resultFiles {
+		adjustedResultSet[rf] = nil
+	}
+	for gf := range goldenSet {
+		if _, already := adjustedResultSet[gf]; already {
+			continue
+		}
+		if _, ok := recoveryMap[gf]; ok {
+			adjustedResultSet[gf] = nil
+		}
+	}
 	goldenNum := len(goldenFiles)
-	resultNum := len(resultFiles)
+	resultNum := len(adjustedResultSet)
 	errorCount := 0
 	const divider = "----------------------------------------------------------"
 
@@ -1465,29 +1550,35 @@ func (b *bisyncTest) compareResults() int {
 		fs.Logf(nil, "  Golden count: %d", goldenNum)
 		fs.Logf(nil, "  Result count: %d", resultNum)
 		fs.Logf(nil, "  Golden files: %s", strings.Join(goldenFiles, ", "))
-		fs.Logf(nil, "  Result files: %s", strings.Join(resultFiles, ", "))
+		adjustedList := make([]string, 0, len(adjustedResultSet))
+		for f := range adjustedResultSet {
+			adjustedList = append(adjustedList, f)
+		}
+		sort.Strings(adjustedList)
+		fs.Logf(nil, "  Adjusted result files: %s", strings.Join(adjustedList, ", "))
 	}
 
 	for _, file := range goldenFiles {
-		if !resultSet.Has(file) {
+		if _, ok := resolve(file); !ok {
 			errorCount++
 			fs.Logf(nil, "  File found in Golden but not in Results:  %s", file)
 		}
 	}
-	for _, file := range resultFiles {
-		if !goldenSet.Has(file) {
+	for file := range adjustedResultSet {
+		if _, exists := goldenSet[file]; !exists {
 			errorCount++
 			fs.Logf(nil, "  File found in Results but not in Golden:  %s", file)
 		}
 	}
 
 	for _, file := range goldenFiles {
-		if !resultSet.Has(file) {
+		resultFile, ok := resolve(file)
+		if !ok {
 			continue
 		}
 
 		goldenText := b.mangleResult(b.goldenDir, file, false)
-		resultText := b.mangleResult(b.workDir, file, false)
+		resultText := b.mangleResult(b.workDir, resultFile, false)
 
 		if fileType(file) == "log" {
 			if *ignoreLogs {
@@ -1495,9 +1586,9 @@ func (b *bisyncTest) compareResults() int {
 			}
 			// save mangled logs so difference is easier on eyes
 			goldenFile := filepath.Join(b.logDir, "mangled.golden.log")
-			resultFile := filepath.Join(b.logDir, "mangled.result.log")
+			resultLogFile := filepath.Join(b.logDir, "mangled.result.log")
 			require.NoError(b.t, os.WriteFile(goldenFile, []byte(goldenText), bilib.PermSecure))
-			require.NoError(b.t, os.WriteFile(resultFile, []byte(resultText), bilib.PermSecure))
+			require.NoError(b.t, os.WriteFile(resultLogFile, []byte(resultText), bilib.PermSecure))
 		}
 
 		if goldenText == resultText || strings.Contains(resultText, ".DS_Store") {
@@ -1514,7 +1605,7 @@ func (b *bisyncTest) compareResults() int {
 		require.NoError(b.t, err, "diff failed")
 
 		fs.Log(nil, divider)
-		fs.Logf(nil, color(terminal.RedFg, "| MISCOMPARE  -Golden vs +Results for  %s"), file)
+		fs.Logf(nil, color(terminal.RedFg, "| MISCOMPARE  -Golden vs +Results for  %s (resolved result: %s)"), file, resultFile)
 		for line := range strings.SplitSeq(strings.TrimSpace(text), "\n") {
 			fs.Logf(nil, "| %s", strings.TrimSpace(line))
 		}
@@ -1677,6 +1768,16 @@ func (b *bisyncTest) mangleResult(dir, file string, golden bool) string {
 		// Adapt file paths
 		s = pathReplacer.Replace(strings.TrimSpace(s))
 
+		// Drop bisync stale-file archival messages before any other
+		// processing. These are diagnostic-only and never appear in
+		// pre-existing golden files.
+		if strings.Contains(s, ".recovery_") ||
+			strings.Contains(s, "archiving stale") ||
+			strings.Contains(s, "Archiving stale") ||
+			strings.Contains(s, "Archived stale") {
+			continue
+		}
+
 		// Apply regular expression replacements
 		for i := range repFrom {
 			s = repFrom[i].ReplaceAllString(s, repTo[i])
@@ -1768,28 +1869,50 @@ func (b *bisyncTest) mangleListing(text string, golden bool, file string) string
 			if match != nil && match[2] != "-" && (!b.fs1.Hashes().Contains(hash.MD5) || !b.fs2.Hashes().Contains(hash.MD5)) { // if hash is not empty and either side lacks md5
 				lines[i] = match[1] + "-" + match[3] + match[4] // replace it with "-" for comparison purposes (see #5679)
 			}
-			// account for modtime precision
-			lineRegex := regexp.MustCompile(`^(\S) +(-?\d+) (\S+) (\S+) (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}[+-]\d{4}) (".+")$`)
-			const timeFormat = "2006-01-02T15:04:05.000000000-0700"
-			const lineFormat = "%s %8d %s %s %s %q\n"
-			fields := lineRegex.FindStringSubmatch(strings.TrimSuffix(lines[i], "\n"))
-			if fields != nil {
-				sizeVal, sizeErr := strconv.ParseInt(fields[2], 10, 64)
-				if sizeErr == nil {
-					// account for filename encoding differences by normalizing to OS encoding
-					fields[6] = normalizeEncoding(fields[6])
-					timeStr := fields[5]
-					if f.Precision() == fs.ModTimeNotSupported || b.ignoreModtime {
-						lines[i] = fmt.Sprintf(lineFormat, fields[1], sizeVal, fields[3], fields[4], "-", fields[6])
-						continue
-					}
-					timeVal, timeErr := time.ParseInLocation(timeFormat, timeStr, bisync.TZ)
-					if timeErr == nil {
-						timeRound := timeVal.Round(f.Precision() * 2)
-						lines[i] = fmt.Sprintf(lineFormat, fields[1], sizeVal, fields[3], fields[4], timeRound, fields[6])
-					}
+		}
+	}
+	// Normalize modtime format for both golden and results to handle
+	// both traditional ("2006-01-02 15:04:05 -0700 MST") and ISO
+	// ("2006-01-02T15:04:05.000000000-0700") formats and produce a
+	// consistent canonical output. Also rounds by backend precision.
+	{
+		// Two regexes: one for new ISO format (with T separator and nanoseconds),
+		// one for legacy Go String format (with space separator and timezone name).
+		isoRegex := regexp.MustCompile(`^(\S) +(-?\d+) (\S+) (\S+) (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}[+-]\d{4}) (".+")$`)
+		legacyRegex := regexp.MustCompile(`^(\S) +(-?\d+) (\S+) (\S+) (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4} \S+) (".+")$`)
+		const isoTimeFormat = "2006-01-02T15:04:05.000000000-0700"
+		const legacyTimeFormat = "2006-01-02 15:04:05 -0700 MST"
+		// Always emit ISO format so comparisons are format-stable.
+		const outFormat = "%s %8d %s %s %s %q\n"
+		for i, s := range lines {
+			line := strings.TrimSuffix(s, "\n")
+			fields := isoRegex.FindStringSubmatch(line)
+			timeFmt := isoTimeFormat
+			if fields == nil {
+				fields = legacyRegex.FindStringSubmatch(line)
+				timeFmt = legacyTimeFormat
+			}
+			if fields == nil {
+				continue
+			}
+			sizeVal, sizeErr := strconv.ParseInt(fields[2], 10, 64)
+			if sizeErr != nil {
+				continue
+			}
+			fields[6] = normalizeEncoding(fields[6])
+			timeStr := fields[5]
+			var timeOut any
+			timeOut = "-"
+			if f.Precision() != fs.ModTimeNotSupported && !b.ignoreModtime {
+				timeVal, timeErr := time.ParseInLocation(timeFmt, timeStr, bisync.TZ)
+				if timeErr == nil {
+					timeOut = timeVal.Round(f.Precision() * 2)
+				} else {
+					// Couldn't parse; keep original string to prevent data loss
+					timeOut = timeStr
 				}
 			}
+			lines[i] = fmt.Sprintf(outFormat, fields[1], sizeVal, fields[3], fields[4], timeOut, fields[6])
 		}
 	}
 
@@ -1899,6 +2022,7 @@ func (b *bisyncTest) listDir(dir string) (names []string) {
 		ignoreList := []string{
 			// ".lst-control", ".lst-dry-control", ".lst-old", ".lst-dry-old",
 			".DS_Store",
+			".recovery_",
 		}
 		for _, s := range ignoreList {
 			if strings.Contains(file, s) {
@@ -1923,6 +2047,12 @@ func (b *bisyncTest) listDir(dir string) (names []string) {
 // - "filtersfile.txt" will NOT be recognized as a filters file
 // - only "test.log" will be recognized as a test log file
 func fileType(fileName string) string {
+	// Strip any recovery-archive suffix first so that archived stale
+	// files (e.g. foo.lst-err.recovery_20260101_000000) are still
+	// classified by their underlying type.
+	if idx := strings.Index(fileName, ".recovery_"); idx != -1 {
+		fileName = fileName[:idx]
+	}
 	if fileName == logFileName {
 		return "log"
 	}

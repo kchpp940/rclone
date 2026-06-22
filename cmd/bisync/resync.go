@@ -44,13 +44,13 @@ func (b *bisyncRun) setResyncDefaults() {
 func (b *bisyncRun) resync(fctx context.Context) (err error) {
 	fs.Infof(nil, "Copying Path2 files to Path1")
 
-	// NOTE: We intentionally do NOT delete prior .lst-err markers or
-	// .lst-new/.lst-old/.que artifacts here. Stale diagnostic state from
-	// previous runs is preserved for debugging and is harmless for --resync
-	// (which ignores historical listings). Any leftover .lst-err will be
-	// overwritten cleanly by markFailed() if *this* run also fails, and
-	// stale listings/queues will be overwritten by the current run's own
-	// output files as it progresses.
+	// NOTE: Stale prior-run files (.lst-new, .lst-old, .que, .lst-err, etc.)
+	// are archived into timestamped recovery files by setLockFile() *before*
+	// this function runs, if and only if a previous run failed (.lst-err
+	// marker present) or the lock file expired. This preserves diagnostic
+	// artifacts across consecutive successful runs (where stale files are
+	// harmless and needed by test scenarios) while ensuring failed-run
+	// state can never interfere with a fresh --resync rebuild.
 
 	// Save blank filelists (will be filled from sync results)
 	ls1 := newFileList()

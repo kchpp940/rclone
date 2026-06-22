@@ -39,9 +39,11 @@ func (b *bisyncRun) setLockFile() (err error) {
 				errTip += fmt.Sprintf(Color(terminal.HiRedFg, "rclone deletefile \"%s\""), b.lockFile)
 				return fmt.Errorf(Color(terminal.RedFg, "prior lock file found: %s \n")+errTip, Color(terminal.HiYellowFg, b.lockFile))
 			}
-			// Lock file was expired - clean up its stale temp files
-			fs.Infof(nil, Color(terminal.GreenFg, "Cleaning up stale files from expired/interrupted prior run"))
-			b.cleanupStaleFiles()
+			// Lock file was expired - archive its stale temp files into
+			// timestamped recovery files so they cannot interfere with this
+			// run but are preserved for diagnosis.
+			fs.Infof(nil, Color(terminal.GreenFg, "Archiving stale files from expired/interrupted prior run"))
+			b.archiveStaleFiles()
 			// Also remove the expired lock file itself so we can recreate it cleanly
 			_ = os.Remove(b.lockFile)
 		}
@@ -54,12 +56,15 @@ func (b *bisyncRun) setLockFile() (err error) {
 		b.renewLockFile()
 		b.lockFileOpt.stopRenewal = b.startLockRenewal()
 	}
-	// NOTE: stale files from prior runs are intentionally NOT deleted when a fresh
-	// lock is acquired. This preserves diagnostic artifacts (-new, -old, queues,
-	// etc.) across consecutive runs, and they will be overwritten or rotated
-	// naturally by the current run. Stale cleanup is reserved for:
-	//   - lock-file expiry (see above)
-	//   - explicit --resync invocation (see resync.go)
+	// After lock acquired, if a failed-run marker (.lst-err) exists from a
+	// previous run, archive all stale prior-run files (listings, queues,
+	// etc.) into timestamped recovery files. This ensures old queued
+	// deltas, old filter hashes, and old error markers never interfere
+	// with the new run while still preserving them for diagnosis.
+	if bilib.FileExists(b.listing1+"-err") || bilib.FileExists(b.listing2+"-err") {
+		fs.Infof(nil, Color(terminal.GreenFg, "Detected failed-run marker; archiving stale listing/queue artifacts from prior run"))
+		b.archiveStaleFiles()
+	}
 	return nil
 }
 
@@ -182,8 +187,84 @@ func markFailed(file string) {
 	}
 }
 
+// archiveStaleFiles moves any leftover temporary files from a prior
+// interrupted/failed run into timestamped "recovery archive" files so they
+// cannot interfere with the current run but are still preserved for
+// diagnostic inspection.
+//
+// Files are renamed with a ".recovery_YYYYMMDD_HHMMSS" suffix using the
+// current time. This is called:
+//   - at the start of a new run (after lock acquired) when .lst-err exists
+//   - when the lock file has expired
+//   - at the start of an explicit --resync invocation
+func (b *bisyncRun) archiveStaleFiles() {
+	ts := time.Now().Format("20060102_150405")
+	suffix := fmt.Sprintf(".recovery_%s", ts)
+
+	patterns := []string{
+		b.listing1 + "-new",
+		b.listing1 + "-old",
+		b.listing1 + "-dry",
+		b.listing1 + "-dry-new",
+		b.listing1 + "-dry-old",
+		b.listing1 + "-err",
+		b.listing2 + "-new",
+		b.listing2 + "-old",
+		b.listing2 + "-dry",
+		b.listing2 + "-dry-new",
+		b.listing2 + "-dry-old",
+		b.listing2 + "-err",
+		b.basePath + ".copy1to2.que",
+		b.basePath + ".copy2to1.que",
+		b.basePath + ".delete1.que",
+		b.basePath + ".delete2.que",
+	}
+	for _, p := range patterns {
+		if !bilib.FileExists(p) {
+			continue
+		}
+		archived := p + suffix
+		if err := os.Rename(p, archived); err != nil {
+			fs.Debugf(nil, "archiveStaleFiles: cannot archive %q -> %q: %v", p, archived, err)
+		} else {
+			fs.Infof(nil, Color(terminal.GreenFg, "Archived stale prior-run file %q -> %q"), p, archived)
+		}
+	}
+	// Also archive any stale .lst-dry* / .lst-new / .que variants via glob
+	if ls, err := filepath.Glob(b.basePath + "*.lst-dry*"); err == nil {
+		for _, f := range ls {
+			archived := f + suffix
+			_ = os.Rename(f, archived)
+		}
+	}
+	if ls, err := filepath.Glob(b.basePath + "*.lst-new"); err == nil {
+		for _, f := range ls {
+			archived := f + suffix
+			_ = os.Rename(f, archived)
+		}
+	}
+	if ls, err := filepath.Glob(b.basePath + "*.lst-old"); err == nil {
+		for _, f := range ls {
+			archived := f + suffix
+			_ = os.Rename(f, archived)
+		}
+	}
+	if ls, err := filepath.Glob(b.basePath + "*.lst-err"); err == nil {
+		for _, f := range ls {
+			archived := f + suffix
+			_ = os.Rename(f, archived)
+		}
+	}
+	if ls, err := filepath.Glob(b.basePath + "*.que"); err == nil {
+		for _, f := range ls {
+			archived := f + suffix
+			_ = os.Rename(f, archived)
+		}
+	}
+}
+
 // cleanupStaleFiles removes any leftover temporary files from a prior interrupted run
-// Call this at the start of a new run (after lock acquired) or when lock expires
+// Deprecated: use archiveStaleFiles() instead to preserve diagnostics
 func (b *bisyncRun) cleanupStaleFiles() {
 	patterns := []string{
 		b.listing1 + "-new",
