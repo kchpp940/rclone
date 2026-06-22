@@ -55,10 +55,24 @@ type File struct {
 	virtualModTime   *time.Time                      // modtime for backends with Precision == fs.ModTimeNotSupported
 	pendingModTime   time.Time                       // will be applied once o becomes available, i.e. after file was written
 	pendingRenameFun func(ctx context.Context) error // will be run/renamed after all writers close
+	pendingRename    *pendingRenameState             // if non-nil, a rename is pending (deferred until all writers close)
 	sys              atomic.Value                    // user defined info to be attached here
 	nwriters         atomic.Int32                    // len(writers)
 	appendMode       bool                            // file was opened with O_APPEND
 	isLink           bool                            // file represents a symlink
+}
+
+// pendingRenameState holds the target of a deferred rename operation.
+// While a rename is pending, the File node, directory entries, cache
+// item, and writeback queue all remain at the old path. When the
+// pending rename is committed (after all writers close), all state
+// is atomically migrated to the new path.
+type pendingRenameState struct {
+	destDir      *Dir   // destination directory
+	newName      string // new leaf name (raw, not cache-fixed)
+	newCacheName string // new leaf name after _fixCachePath
+	newPath      string // full remote path after rename
+	oldPath      string // full remote path before rename
 }
 
 // newFile creates a new File
@@ -213,23 +227,60 @@ func (f *File) renameDir(dPath string) {
 
 // applyPendingRename runs a previously set rename operation if there are no
 // more remaining writers. Call without lock held.
+//
+// On success, all state (file node, directory entries, cache item, writeback
+// queue) is atomically migrated to the new path. On failure, all state remains
+// at the old path.
 func (f *File) applyPendingRename() {
 	f.mu.RLock()
 	fun := f.pendingRenameFun
+	pending := f.pendingRename
 	writing := f._writingInProgress()
 	f.mu.RUnlock()
-	if fun == nil || writing {
+	if fun == nil || pending == nil || writing {
 		return
 	}
-	fs.Debugf(f.Path(), "Running delayed rename now")
+
+	fs.Debugf(pending.oldPath, "Running delayed rename now -> %q", pending.newPath)
+
+	// Save old dir and leaf for directory entry migration
+	// (f.d/f.leaf haven't changed yet since we haven't run renameCall)
+	f.mu.RLock()
+	oldDir := f.d
+	oldLeaf := f.leaf
+	f.mu.RUnlock()
+
+	// Execute the actual rename (remote + cache + node state)
 	if err := fun(f.ctx); err != nil {
-		fs.Errorf(f.Path(), "delayed File.Rename error: %v", err)
+		fs.Errorf(pending.oldPath, "delayed File.Rename error: %v", err)
+		// Leave pendingRenameFun and pendingRename in place so the
+		// rename can be retried on the next writer close.
+		return
+	}
+
+	// Migrate the directory entry from old dir to new dir
+	oldDir.delObject(oldLeaf)
+	pending.destDir.addObject(f)
+
+	if err := oldDir.SetModTime(time.Now()); err != nil {
+		fs.Errorf(oldDir, "applyPendingRename: failed to set modtime on old parent dir: %v", err)
+	}
+	if err := pending.destDir.SetModTime(time.Now()); err != nil {
+		fs.Errorf(pending.destDir, "applyPendingRename: failed to set modtime on new parent dir: %v", err)
 	}
 }
 
 // rename attempts to immediately rename a file if there are no open writers.
 // Otherwise it will queue the rename operation on the remote until no writers
 // remain.
+//
+// When the rename is deferred (pending), the file node, directory entries,
+// cache item, and writeback queue all remain at the old path. The state is
+// atomically migrated to the new path when the pending rename commits
+// (after all writers close). On failure, all state stays at the old path.
+//
+// Returns nil on success (or if rename was deferred). Call HasPendingRename()
+// to check whether the rename was deferred.
 func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 	f.mu.RLock()
 	d := f.d
@@ -247,6 +298,15 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 	// File.mu is unlocked here to call Dir.Path()
 	newPath := path.Join(destDir.Path(), newCacheName)
 
+	// renameCall performs the core rename work: remote move, cache rename,
+	// and node state update (o, d, dPath, leaf, pending*).
+	//
+	// It does NOT move directory entries - that is the caller's responsibility
+	// (Dir.Rename for immediate renames, applyPendingRename for deferred ones).
+	//
+	// On success, the file node is at the new path (but directory entry may
+	// not be moved yet).
+	// On failure, the file node remains at the old path with all state intact.
 	renameCall := func(ctx context.Context) (err error) {
 		// chain rename calls if any
 		if oldPendingRenameFun != nil {
@@ -258,102 +318,99 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 
 		f.mu.RLock()
 		o := f.o
-		d := f.d
+		cache := f.d.vfs.cache
 		f.mu.RUnlock()
+
 		var newObject fs.Object
-		// if o is nil then are writing the file so no need to rename the object
+		// if o is nil then we are writing the file so no need to rename the object
 		if o != nil {
 			if o.Remote() == newPath {
-				return nil // no need to rename
+				// Still need to update node state even if remote path is the same
+				f.mu.Lock()
+				f.d = destDir
+				f.dPath = destDir.Path()
+				f.leaf = newName
+				f.pendingRenameFun = nil
+				f.pendingRename = nil
+				f.mu.Unlock()
+				return nil
 			}
 
 			// do the move of the remote object
 			dstOverwritten, _ := d.Fs().NewObject(ctx, newPath)
 			newObject, err = operations.Move(ctx, d.Fs(), dstOverwritten, newPath, o)
 			if err != nil {
-				fs.Errorf(f.Path(), "File.Rename error: %v", err)
+				fs.Errorf(oldPath, "File.Rename error: %v", err)
 				return err
 			}
 
 			// newObject can be nil here for example if --dry-run
 			if newObject == nil {
 				err = errors.New("rename failed: nil object returned")
-				fs.Errorf(f.Path(), "File.Rename %v", err)
+				fs.Errorf(oldPath, "File.Rename %v", err)
 				return err
 			}
 		}
-		// Rename in the cache
-		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
-			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
-				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
-				// Cache rename failure is non-fatal here; the cache
-				// layer already rolled back its own state so no
-				// ghost files are left behind. The remote rename
-				// already succeeded, so we proceed with updating
-				// the node.
+
+		// Rename in the cache - this rolls back its own state on failure
+		if cache != nil && cache.Exists(oldPath) {
+			if cacheErr := cache.Rename(oldPath, newPath, newObject); cacheErr != nil {
+				fs.Infof(oldPath, "File.Rename failed in Cache: %v", cacheErr)
+				// Non-fatal: remote rename already succeeded, proceed with
+				// node update. Cache will self-heal on next access.
 			}
 		}
-		// Update the node with the new details
-		fs.Debugf(f.Path(), "Updating file with %v %p", newObject, f)
-		// f.rename(destDir, newObject)
+
+		// --- Commit node state ---
 		f.mu.Lock()
 		if newObject != nil {
 			f.o = newObject
 			f._setIsLink()
 		}
+		f.d = destDir
+		f.dPath = destDir.Path()
+		f.leaf = newName
 		f.pendingRenameFun = nil
+		f.pendingRename = nil
 		f.mu.Unlock()
+
 		return nil
 	}
 
-	// Save original state so we can roll back if renameCall fails
-	dPath := destDir.Path()
+	// Check if we need to defer the rename
 	f.mu.Lock()
-	origDir := f.d
-	origDPath := f.dPath
-	origLeaf := f.leaf
-	f.d = destDir
-	f.dPath = dPath
-	f.leaf = newName
 	writing := f._writingInProgress()
+	CacheMode := d.vfs.Opt.CacheMode
+	shouldDefer := writing &&
+		(CacheMode < vfscommon.CacheModeMinimal ||
+			(CacheMode == vfscommon.CacheModeMinimal && !destDir.vfs.cache.Exists(oldPath)))
+
+	if shouldDefer {
+		// --- Deferred path: set pending state, do NOT modify node position ---
+		fs.Debugf(oldPath, "File is currently open, delaying rename %p", f)
+		f.pendingRenameFun = renameCall
+		f.pendingRename = &pendingRenameState{
+			destDir:      destDir,
+			newName:      newName,
+			newCacheName: newCacheName,
+			newPath:      newPath,
+			oldPath:      oldPath,
+		}
+		f.mu.Unlock()
+		return nil
+	}
 	f.mu.Unlock()
 
-	rollbackNodeState := func() {
-		f.mu.Lock()
-		f.d = origDir
-		f.dPath = origDPath
-		f.leaf = origLeaf
-		f.mu.Unlock()
-	}
+	// --- Immediate path: execute rename now ---
+	return renameCall(ctx)
+}
 
-	// Delay the rename if not using RW caching. For the minimal case we
-	// need to look in the cache to see if caching is in use.
-	CacheMode := d.vfs.Opt.CacheMode
-	if writing &&
-		(CacheMode < vfscommon.CacheModeMinimal ||
-			(CacheMode == vfscommon.CacheModeMinimal && !destDir.vfs.cache.Exists(oldPath))) {
-		fs.Debugf(oldPath, "File is currently open, delaying rename %p", f)
-		f.mu.Lock()
-		f.pendingRenameFun = renameCall
-		f.mu.Unlock()
-		// Even though the remote/cache rename is deferred, we must
-		// move the virtual directory entry now so that directory
-		// listings don't show the stale old path for the dirty file.
-		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
-			if isDirty, sz := d.vfs.cache.StatDirty(oldPath); isDirty {
-				_ = d.vfs.DelVirtual(oldPath)
-				_ = d.vfs.AddVirtual(newPath, sz, false)
-			}
-		}
-		return nil
-	}
-
-	err := renameCall(ctx)
-	if err != nil {
-		rollbackNodeState()
-		return err
-	}
-	return nil
+// HasPendingRename returns true if a rename is pending on this file
+// (deferred until all writers close).
+func (f *File) HasPendingRename() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.pendingRename != nil
 }
 
 // addWriter adds a write handle to the file
